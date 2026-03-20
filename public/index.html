@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Concertos — WhatsApp Bot Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Instrument+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --orange: #E85D04;
+            --black: #080807;
+            --dark: #0d0c0a;
+            --card: #151412;
+            --white: #f0ede6;
+            --gray: #908a7e;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--black);
+            color: var(--white);
+            font-family: 'Instrument Sans', sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            width: 100%;
+            max-width: 440px;
+            background: var(--card);
+            border: 1px solid #222;
+            padding: 40px;
+            border-radius: 4px;
+            text-align: center;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+        }
+        .logo {
+            font-family: 'Syne', sans-serif;
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--white);
+            margin-bottom: 40px;
+            letter-spacing: -0.02em;
+        }
+        .logo em { color: var(--orange); font-style: normal; }
+        .status-badge {
+            display: inline-block;
+            padding: 6px 12px;
+            background: rgba(232, 93, 4, 0.1);
+            border: 1px solid rgba(232, 93, 4, 0.3);
+            color: var(--orange);
+            font-family: 'DM Mono', monospace;
+            font-size: 11px;
+            letter-spacing: 0.1em;
+            margin-bottom: 30px;
+        }
+        #qr-container {
+            background: white;
+            padding: 20px;
+            border-radius: 4px;
+            margin: 0 auto 30px;
+            width: 240px;
+            height: 240px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #qr-img { width: 100%; height: 100%; display: none; }
+        #qr-loading { color: var(--black); font-size: 14px; font-weight: 600; }
+        .info {
+            font-size: 14px;
+            color: var(--gray);
+            line-height: 1.6;
+        }
+        .connected { color: #16a34a; border-color: rgba(22,163,74,0.3); background: rgba(22,163,74,0.1); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">CONCERTOS <em>BOT</em></div>
+        <div id="status" class="status-badge">WAITING FOR QR CODE...</div>
+        <div id="qr-container">
+            <div id="qr-loading">Generating...</div>
+            <img id="qr-img" src="" alt="Scan this QR code with WhatsApp">
+        </div>
+        <p class="info">Scan the QR code with your phone to link your WhatsApp account. Once connected, your automations will start running.</p>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const qrImg = document.getElementById('qr-img');
+        const qrLoading = document.getElementById('qr-loading');
+        const status = document.getElementById('status');
+
+        socket.on('qr', (url) => {
+            qrImg.src = url;
+            qrImg.style.display = 'block';
+            qrLoading.style.display = 'none';
+            status.innerText = 'SCAN QR CODE';
+        });
+
+        socket.on('ready', (msg) => {
+            status.innerText = 'WHATSAPP CONNECTED';
+            status.classList.add('connected');
+            qrImg.style.display = 'none';
+            qrLoading.innerText = 'Connected ✅';
+            qrLoading.style.display = 'block';
+            qrLoading.style.color = '#16a34a';
+        });
+
+        socket.on('authenticated', (msg) => {
+            status.innerText = 'AUTHENTICATED';
+        });
+
+        socket.on('disconnected', (msg) => {
+            status.innerText = 'DISCONNECTED';
+            status.classList.remove('connected');
+            qrImg.style.display = 'none';
+            qrLoading.innerText = 'Generating QR...';
+            qrLoading.style.display = 'block';
+            qrLoading.style.color = 'black';
+        });
+
+        socket.on('status', (msg) => {
+            if (status.innerText !== 'WHATSAPP CONNECTED') {
+                status.innerText = msg.toUpperCase();
+            }
+        });
+    </script>
+</body>
+</html>
