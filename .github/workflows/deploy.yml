@@ -1,0 +1,173 @@
+name: Build & Deploy WhatsApp Engine
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/concertos-whatsapp
+  PORT: 3000
+
+jobs:
+  # ─── Job 1: Build & Push Docker Image ───────────────────────
+  build-and-push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=,suffix=,format=timestamp,timestamp_format={{Y}}{{m}}{{d}}{{H}}{{M}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_ENV=production
+
+      - name: Extract image digest
+        run: |
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${{ github.sha }})
+          echo "IMAGE_DIGEST=$DIGEST" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=sha-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Create deployment marker
+        run: |
+          echo "Deployment initiated at $(date -u)"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "${{ github.sha }}" > deployment_sha.txt
+
+      - name: Upload deployment info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info
+          path: deployment_sha.txt
+          retention-days: 1
+
+  # ─── Job 2: Deploy to VPS via SSH ───────────────────────────
+  deploy-vps:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: ${{ github.event.inputs.deploy_env || 'production' }}
+
+    steps:
+      - name: Download deployment info
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-info
+
+      - name: SSH Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          envs: IMAGE_TAG,REGISTRY,IMAGE_NAME
+          script: |
+            set -e
+            export IMAGE_TAG="sha-${{ github.sha }}"
+            export REGISTRY="${{ env.REGISTRY }}"
+            export IMAGE_NAME="${{ env.IMAGE_NAME }}"
+
+            echo "=== Deployment started at $(date -u) ==="
+            echo "Image: $REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+            echo "Actor: ${{ github.actor }}"
+            echo "Commit: ${{ github.sha }}"
+
+            # Pull the new image
+            echo "Pulling Docker image..."
+            docker pull $REGISTRY/$IMAGE_NAME:$IMAGE_TAG
+
+            # Create production env file if it doesn't exist
+            if [ ! -f .env.prod ]; then
+              echo "⚠️ .env.prod not found — using existing .env"
+            fi
+
+            # Stop and remove old container (keep volumes)
+            echo "Stopping old container..."
+            docker stop concertos-whatsapp 2>/dev/null || true
+            docker rm concertos-whatsapp 2>/dev/null || true
+
+            # Run new container with zero-downtime
+            echo "Starting new container..."
+            docker run -d \
+              --name concertos-whatsapp \
+              --restart always \
+              --env-file .env.prod \
+              -p 80:3000 \
+              -v concertos-wwebjs:/app/.wwebjs_auth \
+              -v concertos-logs:/app/logs \
+              $REGISTRY/$IMAGE_NAME:$IMAGE_TAG
+
+            # Wait for health check
+            echo "Waiting for container to be healthy..."
+            for i in $(seq 1 30); do
+              if docker exec concertos-whatsapp wget -qO- http://localhost:3000/health > /dev/null 2>&1; then
+                echo "✅ Container is healthy after ${i} attempts"
+                break
+              fi
+              if [ $i -eq 30 ]; then
+                echo "❌ Health check failed after 30 attempts — rolling back"
+                docker stop concertos-whatsapp
+                docker rm concertos-whatsapp
+                exit 1
+              fi
+              sleep 2
+            done
+
+            echo ""
+            echo "=== Docker Status ==="
+            docker ps --filter "name=concertos-whatsapp"
+            echo ""
+            echo "=== Health Check ==="
+            curl -s http://localhost/health || echo "Health check via curl failed"
+            echo ""
+            echo "=== Recent Logs ==="
+            docker logs --tail 20 concertos-whatsapp
+            echo ""
+            echo "=== Memory ==="
+            free -m
+            echo ""
+            echo "=== Deployment completed at $(date -u) ==="
