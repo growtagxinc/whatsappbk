@@ -80,7 +80,9 @@
 <body>
     <div class="container">
         <div class="logo">CONCERTOS <em>BOT</em></div>
-        <div id="status" class="status-badge">WAITING FOR QR CODE...</div>
+        <div id="status" class="status-badge" role="status" aria-live="polite" aria-label="WhatsApp connection status: waiting for QR code">
+            WAITING FOR QR CODE...
+        </div>
         <div id="qr-container">
             <div id="qr-loading">Generating...</div>
             <img id="qr-img" src="" alt="Scan this QR code with WhatsApp">

@@ -173,9 +173,10 @@ Expected response:
 ```json
 {
   "status": "UP",
-  "whatsapp": "META_CLOUD_API",
+  "whatsapp": "READY",
+  "hasActiveQR": false,
   "isLoaded": true,
-  "metaCloud": true
+  "baileys": { "status": "READY", "connected": true }
 }
 ```
 
@@ -237,9 +238,6 @@ docker volume inspect concertos-wwebjs
 |---|---|---|
 | `PORT` | Yes | Internal container port (default: 3000) |
 | `NODE_ENV` | Yes | Set to `production` |
-| `WHATSAPP_TOKEN` | Yes | Meta Cloud API access token |
-| `WHATSAPP_PHONE_NUMBER_ID` | Yes | Meta Phone Number ID |
-| `WHATSAPP_VERIFY_TOKEN` | Yes | Random string for Meta webhook verification |
 | `MONGODB_URI` | Yes | MongoDB connection string |
 | `REDIS_URL` | Yes | Redis/Upstash connection string |
 | `GROQ_API_KEY` | Yes | Groq API key for AI features |
@@ -251,7 +249,7 @@ docker volume inspect concertos-wwebjs
 | `ALLOW_UNAUTHENTICATED` | Yes | `false` in production |
 | `RATE_LIMIT_WINDOW_MS` | Yes | Rate limit window in ms |
 | `RATE_LIMIT_MAX_MESSAGES` | Yes | Max messages per window |
-| `USE_BAILEYS` | Yes | Set to `false` for Meta Cloud API mode |
+| `USE_BAILEYS` | Yes | Set to `false` for Puppeteer fallback |
 | `ADMIN_WHATSAPP_NUMBER` | Yes | Admin WhatsApp number |
 | `PAPERCLIP_API_URL` | Yes | Paperclip API URL |
 | `PAPERCLIP_COMPANY_ID` | Yes | Paperclip company ID |
