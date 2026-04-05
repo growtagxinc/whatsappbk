@@ -100,25 +100,6 @@ class WhatsAppManager {
 
         sock.ev.on('creds.update', saveCreds);
 
-    // Debug: capture raw socket errors
-    sock.ws?.on('error', (err) => {
-        console.error(`[Baileys WS Error] ${clientId}:`, err.message);
-    });
-
-    // Enhanced connection monitoring
-    sock.ws?.on('close', (code, reason) => {
-        console.log(`[Baileys WS Close] ${clientId}: Code ${code}, Reason: ${reason}`);
-        // Implement reconnection strategy for unexpected closures
-        if (code !== 1000) { // Normal closure
-            setTimeout(() => {
-                console.log(`[Baileys] Attempting reconnect for ${clientId}`);
-                this.initializeSession(clientId).catch(err => {
-                    console.error(`[Baileys] Reconnect failed for ${clientId}:`, err.message);
-                });
-            }, 5000); // Retry after 5 seconds
-        }
-    });
-
         // ── Phase 3: Wire incoming messages to Swarm/blackboard ──────────────
         sock.ev.on('messages.upsert', async ({ messages }) => {
             for (const msg of messages) {
@@ -358,41 +339,47 @@ class WhatsAppManager {
     async _onConnected(clientId, sock) {
         try {
             const Session = require('../../models/Session');
+            const waWid = sock.user?.id || '';
+            const waPhone = waWid.replace('@s.whatsapp.net', '').replace('@c.us', '');
+
             await Session.findOneAndUpdate(
                 { clientId },
-                { authenticated: true, is_onboarded: true, status: 'READY' },
+                {
+                    authenticated: true,
+                    is_onboarded: true,
+                    status: 'READY',
+                    whatsappConnected: true,
+                    whatsappWid: waWid,
+                    phone: waPhone || undefined,
+                },
                 { upsert: true }
             );
+
+            // Cross-session sync: propagate whatsappConnected to all sessions sharing the same phone
+            if (waPhone) {
+                await Session.updateMany(
+                    { clientId: { $ne: clientId }, phone: waPhone },
+                    { $set: { whatsappConnected: true, lastActive: new Date() } }
+                ).catch(() => {});
+            }
+
+            console.log(`[Baileys] WhatsApp connected for ${clientId} (${waPhone || waWid})`);
         } catch (e) {
             console.warn(`[Baileys] DB update skipped (no Mongo): ${e.message}`);
         }
 
-        // Lazy sync — only last N chats, no message history, no media
+        // Lazy sync — fetch group chats (no full message history)
         try {
-            const chats = await sock.core.emit('getChats', { count: LAZY_SYNC_CHAT_LIMIT });
-            if (Array.isArray(chats)) {
-                const chatList = chats.slice(0, LAZY_SYNC_CHAT_LIMIT).map(c => ({
-                    jid: c.jid,
-                    name: c.name || c.jid,
-                }));
-                this._emit(clientId, 'chat_list', chatList);
-            }
+            const inbox = await sock.groupFetchAllParticipating?.() || {};
+            const chatList = Object.values(inbox)
+                .slice(0, LAZY_SYNC_CHAT_LIMIT)
+                .map(c => ({ jid: c.id, name: c.subject || c.name || c.id }));
+            this._emit(clientId, 'chat_list', chatList);
         } catch (e) {
-            // Fallback: try the legacy approach
-            try {
-                const inbox = await sock.groupFetchAllParticipating?.();
-                if (inbox) {
-                    const chatList = Object.values(inbox)
-                        .slice(0, LAZY_SYNC_CHAT_LIMIT)
-                        .map(c => ({ jid: c.id, name: c.subject || c.name || c.id }));
-                    this._emit(clientId, 'chat_list', chatList);
-                }
-            } catch (e2) {
-                console.warn(`[Baileys] Chat sync skipped: ${e2.message}`);
-            }
+            console.warn(`[Baileys] Chat sync skipped: ${e.message}`);
         }
 
-        // Send self-confirmation
+        // Send self-confirmation (best effort — don't block on failure)
         try {
             const jid = sock.user?.id;
             if (jid) {
@@ -710,34 +697,26 @@ class WhatsAppManager {
         // Start new health check interval (every 30 seconds)
         const healthCheckInterval = setInterval(async () => {
             try {
-                // Check if socket is still valid
-                if (!sock || !sock.ws || sock.ws.readyState !== 1) {
+                // Check if socket is still connected using readyState
+                if (sock.ws?.readyState === 1) {
+                    // Reset reconnect attempts on successful health check
+                    this.reconnectAttempts.set(clientId, 0);
+                } else {
+                    // Socket dead — clear old health check and reconnect
                     console.warn(`[HealthCheck] Socket invalid for ${clientId}, attempting reconnect`);
-                    clearInterval(this.healthChecks.get(clientId));
+                    clearInterval(healthCheckInterval);
                     this.healthChecks.delete(clientId);
-                    
-                    // Increment reconnect attempts
+
                     const attempts = (this.reconnectAttempts.get(clientId) || 0) + 1;
                     this.reconnectAttempts.set(clientId, attempts);
-                    
-                    // Limit reconnect attempts to prevent infinite loops
+
                     if (attempts <= 3) {
                         await this.initializeSession(clientId);
                     } else {
                         console.error(`[HealthCheck] Max reconnect attempts reached for ${clientId}`);
                         this.reconnectAttempts.delete(clientId);
                     }
-                    return;
                 }
-                
-                // Send a ping message to test connection (lightweight)
-                if (sock.query) {
-                    await sock.query({ tag: 'ping', attrs: { id: 'conn-check-' + Date.now() } });
-                }
-                
-                // Reset reconnect attempts on successful health check
-                this.reconnectAttempts.set(clientId, 0);
-                
             } catch (err) {
                 console.warn(`[HealthCheck] Error for ${clientId}:`, err.message);
             }

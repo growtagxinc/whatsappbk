@@ -189,7 +189,18 @@ app.get('/api/profiles', (req, res, next) => {
             return res.json({ session: updated });
         }
 
-        res.json({ session });
+        // Hybrid WhatsApp status: live Baileys state is primary, DB is fallback
+        const baileysStatus = USE_BAILEYS && baileysManager
+            ? baileysManager.getStatus(userId)
+            : { status: 'NOT_INITIALIZED', connected: false };
+
+        res.json({
+            session,
+            baileysStatus, // Live Baileys state for real-time accuracy
+            whatsappConnected: baileysStatus.connected
+                ? true
+                : session.whatsappConnected || false,
+        });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -394,14 +405,30 @@ app.get('/api/google/callback', async (req, res) => {
         const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
         const userInfo = await oauth2.userinfo.get();
 
+        const email = userInfo.data.email;
+        const displayName = userInfo.data.name || email;
+
+        // Update Session (backward compat)
         await Session.findOneAndUpdate(
             { clientId },
             {
                 googleTokens: tokens,
-                googleEmail: userInfo.data.email,
-                email: userInfo.data.email,
-                displayName: userInfo.data.name || userInfo.data.email,
+                googleEmail: email,
+                email: email,
+                displayName: displayName,
                 authenticated: true
+            },
+            { upsert: true }
+        );
+
+        // Update User (canonical source of truth for Google tokens)
+        await User.findOneAndUpdate(
+            { email },
+            {
+                googleTokens: tokens,
+                googleEmail: email,
+                email: email,
+                displayName: displayName,
             },
             { upsert: true }
         );
@@ -437,10 +464,22 @@ app.post('/api/google/verify', async (req, res) => {
         const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
         const userInfo = await oauth2.userinfo.get();
 
-        // Update session with tokens
+        // Update session with tokens (backward compat)
         await Session.findOneAndUpdate(
             { clientId },
-            { 
+            {
+                googleTokens: tokens,
+                googleEmail: userInfo.data.email,
+                email: userInfo.data.email,
+                displayName: userInfo.data.name || userInfo.data.email
+            },
+            { upsert: true }
+        );
+
+        // Update User model (canonical source of truth)
+        await User.findOneAndUpdate(
+            { email: userInfo.data.email },
+            {
                 googleTokens: tokens,
                 googleEmail: userInfo.data.email,
                 email: userInfo.data.email,
@@ -450,7 +489,7 @@ app.post('/api/google/verify', async (req, res) => {
         );
 
         console.log(`✅ Google Account Linked for ${clientId}: ${userInfo.data.email}`);
-        
+
         res.json({ success: true, email: userInfo.data.email });
     } catch (err) {
         console.error('❌ Google Auth Verify Error:', err.message);
