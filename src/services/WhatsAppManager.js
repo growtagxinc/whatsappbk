@@ -96,6 +96,7 @@ class WhatsAppManager {
         });
 
         clients.set(clientId, sock);
+        let _onConnectedFired = false; // Guard: only run _onConnected once per init
         sessions.set(clientId, { socket: sock, initialized: false });
 
         sock.ev.on('creds.update', saveCreds);
@@ -164,6 +165,8 @@ class WhatsAppManager {
             const { connection, lastDisconnect } = update;
 
             if (connection === 'open') {
+                if (_onConnectedFired) return; // Guard: skip if _onConnected already ran
+                _onConnectedFired = true;
                 console.log(`[Baileys] Connected for ${clientId}`);
                 this._updateStatus(clientId, 'READY', { authenticated: true, qr: null });
                 this._emit(clientId, 'ready', 'Baileys Connected');
@@ -171,13 +174,15 @@ class WhatsAppManager {
                 await this._onConnected(clientId, sock);
                 
                 // Start health check for this client
-                this._startHealthCheck(clientId, sock);
+                this._startHealthCheck(clientId);
             }
 
             if (connection === 'close') {
                 const errMsg = lastDisconnect?.error?.message || '';
                 const errTag = lastDisconnect?.error?.output?.statusCode;
                 const wasIntentional = errTag === 500 && errMsg.includes('restart');
+
+                console.log(`[Baileys] close event for ${clientId}: intentional=${wasIntentional} tag=${errTag} msg="${errMsg}"`);
 
                 // ── Detect 405 link-rejected failure ──────────────────────────
                 // WhatsApp returns 405 when:
@@ -688,40 +693,42 @@ class WhatsAppManager {
     /**
      * Start periodic health check for a client connection
      */
-    _startHealthCheck(clientId, sock) {
+    _startHealthCheck(clientId) {
         // Clear any existing health check for this client
         if (this.healthChecks.has(clientId)) {
             clearInterval(this.healthChecks.get(clientId));
         }
-        
-        // Start new health check interval (every 30 seconds)
+
+        // Look up the LIVE socket on every tick — don't close over a stale reference.
+        // The old socket reference (passed as `sock`) becomes invalid after reconnect.
         const healthCheckInterval = setInterval(async () => {
             try {
-                // Check if socket is still connected using readyState
-                if (sock.ws?.readyState === 1) {
-                    // Reset reconnect attempts on successful health check
+                const sock = clients.get(clientId);
+                if (sock?.ws?.readyState === 1) {
+                    // Socket still alive — reset reconnect counter
                     this.reconnectAttempts.set(clientId, 0);
-                } else {
-                    // Socket dead — clear old health check and reconnect
-                    console.warn(`[HealthCheck] Socket invalid for ${clientId}, attempting reconnect`);
-                    clearInterval(healthCheckInterval);
-                    this.healthChecks.delete(clientId);
-
-                    const attempts = (this.reconnectAttempts.get(clientId) || 0) + 1;
-                    this.reconnectAttempts.set(clientId, attempts);
-
-                    if (attempts <= 3) {
-                        await this.initializeSession(clientId);
-                    } else {
-                        console.error(`[HealthCheck] Max reconnect attempts reached for ${clientId}`);
-                        this.reconnectAttempts.delete(clientId);
-                    }
+                    return;
                 }
+
+                // Socket dead — prevent concurrent reconnect loops.
+                // If reconnect is already in progress, skip.
+                const existingAttempts = this.reconnectAttempts.get(clientId) || 0;
+                if (existingAttempts > 0) {
+                    console.warn(`[HealthCheck] Reconnect already in progress for ${clientId}, skipping duplicate`);
+                    return;
+                }
+
+                console.warn(`[HealthCheck] Socket invalid for ${clientId}, attempting reconnect`);
+                clearInterval(healthCheckInterval);
+                this.healthChecks.delete(clientId);
+
+                this.reconnectAttempts.set(clientId, 1);
+                await this.initializeSession(clientId);
             } catch (err) {
                 console.warn(`[HealthCheck] Error for ${clientId}:`, err.message);
             }
         }, 30000); // Check every 30 seconds
-        
+
         this.healthChecks.set(clientId, healthCheckInterval);
     }
 
