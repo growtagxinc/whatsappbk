@@ -49,8 +49,6 @@ jobs:
           tags: |
             type=sha,format=long
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=sha,prefix=,suffix=,format=timestamp,timestamp_format={{Y}}{{m}}{{d}}{{H}}{{M}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -66,9 +64,9 @@ jobs:
 
       - name: Extract image digest
         run: |
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:${{ github.sha }})
-          echo "IMAGE_DIGEST=$DIGEST" >> $GITHUB_OUTPUT
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
           echo "IMAGE_TAG=sha-${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "Docker images pushed successfully"
 
       - name: Create deployment marker
         run: |
