@@ -216,11 +216,20 @@ app.post('/api/profiles/init', authMiddleware, async (req, res) => {
 
         const clientId = req.userId || req.headers['x-client-id'] || 'default';
 
-        // Guard: if already has a QR in DB, don't re-init (prevents QR spam)
+        // Guard: if already has a QR in DB AND auth files exist on disk, reuse it.
+        // If the auth files were wiped (e.g. server restart), the stale QR will be
+        // rejected by WhatsApp — clear it so a fresh one is generated.
+        const clientDir = path.join(process.cwd(), 'sessions', clientId);
+        const hasAuthFiles = fs.existsSync(clientDir);
         const existingSession = await Session.findOne({ clientId });
-        if (existingSession?.qr && existingSession?.status === 'UNAUTHENTICATED') {
-            console.log(`[Init] QR already exists for ${clientId}, skipping re-init`);
+        if (existingSession?.qr && existingSession?.status === 'UNAUTHENTICATED' && hasAuthFiles) {
+            console.log(`[Init] QR already exists for ${clientId}, reusing (auth files present)`);
             return res.json({ success: true, message: "QR already available" });
+        }
+        // QR is stale (no auth files) — clear it and regenerate
+        if (existingSession?.qr) {
+            await Session.updateOne({ clientId }, { $set: { qr: null, status: 'DISCONNECTED' } });
+            console.log(`[Init] Cleared stale QR for ${clientId} (no auth files)`);
         }
 
         if (USE_BAILEYS && baileysManager) {
@@ -3728,9 +3737,15 @@ io.on('connection', (socket) => {
         }
 
         const waSession = await Session.findOne({ clientId: waClientId });
-        console.log(`[JOIN] clientId=${clientId} waClientId=${waClientId} waSession.status=${waSession?.status} waSession.qr=${waSession?.qr ? 'HAS_QR' : 'null'} waSession.wid=${waSession?.whatsappWid}`);
-        if (waSession?.qr) {
+        // Only emit stored QR if auth files exist on disk — stale DB QR causes immediate close
+        const hasAuthFiles = fs.existsSync(path.join(process.cwd(), 'sessions', waClientId));
+        console.log(`[JOIN] clientId=${clientId} waClientId=${waClientId} waSession.status=${waSession?.status} waSession.qr=${waSession?.qr ? 'HAS_QR' : 'null'} hasAuth=${hasAuthFiles} waSession.wid=${waSession?.whatsappWid}`);
+        if (waSession?.qr && hasAuthFiles) {
             socket.emit('qr', waSession.qr);
+        } else if (waSession?.qr && !hasAuthFiles) {
+            // QR in DB but no auth files — clear it, don't emit stale QR
+            await Session.updateOne({ clientId: waClientId }, { $set: { qr: null, status: 'DISCONNECTED' } });
+            socket.emit('status', 'DISCONNECTED');
         } else if (waSession?.status === 'READY') {
             socket.emit('ready', 'Connected');
         } else {

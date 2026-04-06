@@ -69,12 +69,17 @@ class WhatsAppManager {
         // Return existing authenticated socket
         if (clients.has(clientId)) {
             const sock = clients.get(clientId);
-            if (sock.ws && sock.ws.readyState === 1) return sock;
+            if (sock.ws && sock.ws.readyState === 1) {
+                console.log(`[Baileys] Reusing existing socket for ${clientId} (readyState=${sock.ws.readyState})`);
+                return sock;
+            }
+            console.log(`[Baileys] Stale socket found for ${clientId} (readyState=${sock.ws?.readyState}), reinitializing`);
         }
 
-        console.log(`[Baileys] Initializing session for: ${clientId}`);
+        const seq = (this._initSeq = (this._initSeq || 0) + 1);
+        console.log(`[Baileys] [SEQ=${seq}] INITIALIZING session for: ${clientId} (clients.size=${clients.size})`);
         this._resetIdleTimer(clientId);
-        
+
         // Reset state for a fresh init — clear any lingering health check
         if (this.healthChecks.has(clientId)) {
             clearInterval(this.healthChecks.get(clientId));
@@ -105,6 +110,8 @@ class WhatsAppManager {
         clients.set(clientId, sock);
         this._onConnectedFired.set(clientId, false);
         sessions.set(clientId, { socket: sock, initialized: false });
+        sock._clientSeq = (this._sockSeq = (this._sockSeq || 0) + 1);
+        console.log(`[Baileys] [SOCK=${sock._clientSeq}] Created socket for ${clientId}, clients.size=${clients.size}`);
 
         sock.ev.on('creds.update', saveCreds);
 
@@ -172,14 +179,20 @@ class WhatsAppManager {
             const { connection, lastDisconnect } = update;
 
             if (connection === 'open') {
-                if (this._onConnectedFired.get(clientId)) return; // Guard: skip if _onConnected already ran
+                const sockSeq = (sock._seq = (sock._seq || 0) + 1);
+                console.log(`[Baileys] [SEQ=${sockSeq}] OPEN event for ${clientId} (wasConnected=${this._onConnectedFired.get(clientId)})`);
+                if (this._onConnectedFired.get(clientId)) {
+                    console.log(`[Baileys] [SEQ=${sockSeq}] OPEN skipped — _onConnected already ran for this client`);
+                    return; // Guard: skip if _onConnected already ran
+                }
                 this._onConnectedFired.set(clientId, true);
-                console.log(`[Baileys] Connected for ${clientId}`);
+                console.log(`[Baileys] [SEQ=${sockSeq}] Connected for ${clientId}, running _onConnected...`);
                 this._updateStatus(clientId, 'READY', { authenticated: true, qr: null });
                 this._emit(clientId, 'ready', 'Baileys Connected');
                 sessions.get(clientId).initialized = true;
                 await this._onConnected(clientId, sock);
-                
+                console.log(`[Baileys] [SEQ=${sockSeq}] _onConnected DONE for ${clientId}`);
+
                 // Start health check for this client
                 this._startHealthCheck(clientId);
             }
@@ -188,12 +201,19 @@ class WhatsAppManager {
                 const errMsg = lastDisconnect?.error?.message || '';
                 const errTag = lastDisconnect?.error?.output?.statusCode;
                 const wasIntentional = errTag === 500 && errMsg.includes('restart');
+                const currentSock = clients.get(clientId);
+                const isCurrent = currentSock === sock;
+                const sockSeq = sock._clientSeq || '?';
+
+                console.log(`[Baileys] [SOCK=${sockSeq}] CLOSE event for ${clientId}: intentional=${wasIntentional} tag=${errTag} msg="${errMsg}" | isCurrent=${isCurrent} | clients.size=${clients.size}`);
 
                 // Only reset _onConnectedFired if this is the CURRENT active socket.
                 // Old sockets from a previous init may fire close AFTER new socket connects.
-                const currentSock = clients.get(clientId);
-                if (currentSock === sock) {
+                if (isCurrent) {
                     this._onConnectedFired.set(clientId, false);
+                    console.log(`[Baileys] [SOCK=${sockSeq}] RESET _onConnectedFired (was current socket)`);
+                } else {
+                    console.log(`[Baileys] [SOCK=${sockSeq}] Did NOT reset _onConnectedFired (was OLD socket, current is ${currentSock?._clientSeq || 'none'})`);
                 }
 
                 console.log(`[Baileys] close event for ${clientId}: intentional=${wasIntentional} tag=${errTag} msg="${errMsg}"`);
@@ -380,7 +400,7 @@ class WhatsAppManager {
                 ).catch(() => {});
             }
 
-            console.log(`[Baileys] WhatsApp connected for ${clientId} (${waPhone || waWid})`);
+            console.log(`[Baileys] WhatsApp connected for ${clientId} (${waPhone || waWid}) | whatsappConnected=true`);
         } catch (e) {
             console.warn(`[Baileys] DB update skipped (no Mongo): ${e.message}`);
         }
