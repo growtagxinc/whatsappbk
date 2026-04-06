@@ -245,7 +245,7 @@ router.post('/register', async (req, res) => {
             plan: 'trial',
             trialEndsAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
         });
-        await org.save();
+        try { await org.save(); } catch(e) { e.step = 'Organisation'; throw e; }
 
         // ── Create OrgMember ────────────────────────────────
         const member = new OrgMember({
@@ -253,7 +253,7 @@ router.post('/register', async (req, res) => {
             orgId,
             role: 'owner',
         });
-        await member.save();
+        try { await member.save(); } catch(e) { e.step = 'OrgMember'; throw e; }
 
         // ── Create User ────────────────────────────────────
         const user = new User({
@@ -265,7 +265,7 @@ router.post('/register', async (req, res) => {
             authMethods: ['password'],
             primaryOrgId: orgId,
         });
-        await user.save();
+        try { await user.save(); } catch(e) { e.step = 'User'; throw e; }
 
         // ── Create Workspace ────────────────────────────────
         const ws = new Workspace({
@@ -273,7 +273,7 @@ router.post('/register', async (req, res) => {
             orgId,
             name: (workspaceName || orgName).trim(),
         });
-        await ws.save();
+        try { await ws.save(); } catch(e) { e.step = 'Workspace'; throw e; }
 
         // ── Create Session (legacy WhatsApp state container) ─
         const session = new Session({
@@ -288,7 +288,7 @@ router.post('/register', async (req, res) => {
             company: orgName.trim(),
             onboardingStep: 1,
         });
-        await session.save();
+        try { await session.save(); } catch(e) { e.step = 'Session'; throw e; }
 
         // ── Create AIConfig ────────────────────────────────
         const aiConfig = new AIConfig({
@@ -297,7 +297,7 @@ router.post('/register', async (req, res) => {
             workspaceId,
             businessName: (workspaceName || orgName).trim(),
         });
-        await aiConfig.save();
+        try { await aiConfig.save(); } catch(e) { e.step = 'AIConfig'; throw e; }
 
         // ── Issue JWT ─────────────────────────────────────
         const token = issueToken(userId, orgId, workspaceId);
@@ -337,7 +337,20 @@ router.post('/register', async (req, res) => {
         });
     } catch (err) {
         console.error('Register error:', err);
-        res.status(500).json({ error: 'Registration failed' });
+        // Return a structured error with a safe error code — helps debug without exposing internals
+        const errorMap = {
+            ValidationError: { status: 400, code: 'VALIDATION_ERROR' },
+            MongoServerError: { status: 500, code: err.code === 11000 ? 'DUPLICATE_KEY' : 'DB_ERROR' },
+            MongoNetworkError: { status: 503, code: 'DB_UNAVAILABLE' },
+            MongoTimeoutError: { status: 503, code: 'DB_TIMEOUT' },
+        };
+        const mapped = errorMap[err.name] || { status: 500, code: 'UNKNOWN_ERROR' };
+        // Include a safe error tag only — no stack traces or internals in response
+        res.status(mapped.status).json({
+            error: 'Registration failed',
+            code: mapped.code,
+            step: err.step || null,
+        });
     }
 });
 
@@ -609,6 +622,17 @@ router.get('/google/callback', async (req, res) => {
             const token = issueToken(userId, orgId, workspaceId);
             setTokenCookie(res, token);
 
+            // Also set a JS-readable cookie (not httpOnly) so the frontend can store
+            // the token in localStorage even if the httpOnly cookie isn't sent
+            // (handles cross-origin / cookie-not-sent edge cases)
+            res.cookie('concertos_token_js', token, {
+                httpOnly: false,
+                secure: true,
+                sameSite: 'lax',
+                maxAge: 60 * 1000, // Short-lived: 60s, cleared after frontend reads it
+                path: '/',
+                domain: '.brandproinc.in',
+            });
             return res.redirect(`${process.env.FRONTEND_URL || 'https://dash.concertos.brandproinc.in'}?registered=1`);
 
         } else if (action === 'login') {
@@ -636,6 +660,16 @@ router.get('/google/callback', async (req, res) => {
             const token = issueToken(user.clientId, orgId, workspaceId);
             console.log('[GoogleOAuth] Login token issued for:', user.email, '| token:', token.substring(0, 30) + '...');
             setTokenCookie(res, token);
+
+            // Also set a JS-readable cookie so frontend can store token in localStorage
+            res.cookie('concertos_token_js', token, {
+                httpOnly: false,
+                secure: true,
+                sameSite: 'lax',
+                maxAge: 60 * 1000,
+                path: '/',
+                domain: '.brandproinc.in',
+            });
 
             // Sync canonical fields + workspaceId/orgId into Session (upsert in case session was wiped)
             await Session.findOneAndUpdate(
