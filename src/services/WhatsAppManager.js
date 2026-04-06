@@ -166,20 +166,7 @@ class WhatsAppManager {
         });
         // ─────────────────────────────────────────────────────────────────────
 
-        // Baileys v6: QR is a SEPARATE event (not in connection.update)
-        sock.ev.on('qr', async (qr) => {
-            console.log(`[Baileys] QR RECEIVED for ${clientId}`);
-            try {
-                const QR = require('qrcode');
-                const qrUrl = await QR.toDataURL(qr);
-                console.log(`[Baileys] QR encoded for ${clientId}, len=${qrUrl.length}`);
-                this._emit(clientId, 'qr', qrUrl);
-                this._updateStatus(clientId, 'UNAUTHENTICATED', { qr: qrUrl });
-            } catch (e) {
-                console.error(`[Baileys] QR encoding failed for ${clientId}: ${e.message}`);
-            }
-        });
-
+        // QR is handled inside connection.update (qr field in v6)
         // ── Pairing Code (WhatsApp Web-style 8-digit code) ──────────────────
         sock.ev.on('CB:iq,,pair-success', async (stanza) => {
             console.log(`[Baileys] Pairing SUCCESS for ${clientId}`);
@@ -188,7 +175,29 @@ class WhatsAppManager {
         });
 
         sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect } = update;
+            const { connection, lastDisconnect, qr } = update;
+
+            // Log ALL connection.update events for debugging
+            if (connection !== 'open' && connection !== 'close' && !qr) {
+                console.log(`[Baileys] connection.update: conn=${connection} qr=${qr ? 'YES' : 'none'} update=${JSON.stringify(update)}`);
+            }
+
+            // Baileys v6 emits QR via connection.update as { qr } — but only if
+            // the pairing handshake reaches genPairQR() before CB:failure kills the emitter.
+            // When WhatsApp sends <failure>, end() removes all listeners before QR can fire.
+            if (qr) {
+                console.log(`[Baileys] QR RECEIVED for ${clientId}`);
+                try {
+                    const QR = require('qrcode');
+                    const qrUrl = await QR.toDataURL(qr);
+                    console.log(`[Baileys] QR encoded for ${clientId}, len=${qrUrl.length}`);
+                    this._emit(clientId, 'qr', qrUrl);
+                    this._updateStatus(clientId, 'UNAUTHENTICATED', { qr: qrUrl });
+                } catch (e) {
+                    console.error(`[Baileys] QR encoding failed for ${clientId}: ${e.message}`);
+                }
+                return;
+            }
 
             if (connection === 'open') {
                 const sockSeq = (sock._seq = (sock._seq || 0) + 1);
