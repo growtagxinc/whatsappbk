@@ -40,6 +40,8 @@ class WhatsAppManager {
         this.groqClient = null;
         this.reconnectAttempts = new Map(); // Track reconnect attempts per client
         this.healthChecks = new Map(); // Track health check intervals
+        this._onConnectedFired = new Map(); // Track per-client whether _onConnected has run for current socket
+        this._healthCheckStopped = new Map(); // Track whether health check was stopped by close event
 
         // Ensure session directory exists
         if (!fs.existsSync(SESSION_DIR)) {
@@ -73,7 +75,12 @@ class WhatsAppManager {
         console.log(`[Baileys] Initializing session for: ${clientId}`);
         this._resetIdleTimer(clientId);
         
-        // Reset reconnect attempts counter when starting fresh
+        // Reset state for a fresh init — clear any lingering health check
+        if (this.healthChecks.has(clientId)) {
+            clearInterval(this.healthChecks.get(clientId));
+            this.healthChecks.delete(clientId);
+        }
+        this._onConnectedFired.set(clientId, false);
         this.reconnectAttempts.set(clientId, 0);
 
         const clientDir = path.join(SESSION_DIR, clientId);
@@ -96,7 +103,7 @@ class WhatsAppManager {
         });
 
         clients.set(clientId, sock);
-        let _onConnectedFired = false; // Guard: only run _onConnected once per init
+        this._onConnectedFired.set(clientId, false);
         sessions.set(clientId, { socket: sock, initialized: false });
 
         sock.ev.on('creds.update', saveCreds);
@@ -165,8 +172,8 @@ class WhatsAppManager {
             const { connection, lastDisconnect } = update;
 
             if (connection === 'open') {
-                if (_onConnectedFired) return; // Guard: skip if _onConnected already ran
-                _onConnectedFired = true;
+                if (this._onConnectedFired.get(clientId)) return; // Guard: skip if _onConnected already ran
+                this._onConnectedFired.set(clientId, true);
                 console.log(`[Baileys] Connected for ${clientId}`);
                 this._updateStatus(clientId, 'READY', { authenticated: true, qr: null });
                 this._emit(clientId, 'ready', 'Baileys Connected');
@@ -181,6 +188,13 @@ class WhatsAppManager {
                 const errMsg = lastDisconnect?.error?.message || '';
                 const errTag = lastDisconnect?.error?.output?.statusCode;
                 const wasIntentional = errTag === 500 && errMsg.includes('restart');
+
+                // Only reset _onConnectedFired if this is the CURRENT active socket.
+                // Old sockets from a previous init may fire close AFTER new socket connects.
+                const currentSock = clients.get(clientId);
+                if (currentSock === sock) {
+                    this._onConnectedFired.set(clientId, false);
+                }
 
                 console.log(`[Baileys] close event for ${clientId}: intentional=${wasIntentional} tag=${errTag} msg="${errMsg}"`);
 
@@ -240,15 +254,13 @@ class WhatsAppManager {
                     sessions.delete(clientId);
                     linkFailures.delete(clientId);
                     
-                    // Clear health check for this client
+                    // Clear health check for this client — signal it so health check doesn't fight us
+                    this._healthCheckStopped.set(clientId, true);
                     if (this.healthChecks.has(clientId)) {
                         clearInterval(this.healthChecks.get(clientId));
                         this.healthChecks.delete(clientId);
                     }
-                    
-                    // Clear reconnect attempts for this client
-                    this.reconnectAttempts.delete(clientId);
-                    
+
                     // Implement automatic reconnection with exponential backoff
                     const attempts = (this.reconnectAttempts.get(clientId) || 0) + 1;
                     this.reconnectAttempts.set(clientId, attempts);
@@ -703,6 +715,13 @@ class WhatsAppManager {
         // The old socket reference (passed as `sock`) becomes invalid after reconnect.
         const healthCheckInterval = setInterval(async () => {
             try {
+                // If the close handler already stopped us, don't fight it
+                if (this._healthCheckStopped.get(clientId)) {
+                    clearInterval(healthCheckInterval);
+                    this.healthChecks.delete(clientId);
+                    return;
+                }
+
                 const sock = clients.get(clientId);
                 if (sock?.ws?.readyState === 1) {
                     // Socket still alive — reset reconnect counter
