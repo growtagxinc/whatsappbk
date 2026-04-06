@@ -17,7 +17,7 @@ const UserSchema = new mongoose.Schema({
     },
     password: {
         type: String,
-        required: false, // Optional — Google users set this during onboarding
+        required: true, // bcrypt hashed
     },
     phone: {
         type: String,

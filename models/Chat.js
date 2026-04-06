@@ -14,13 +14,10 @@ const ChatSchema = new mongoose.Schema({
     unread:    { type: Number, default: 0 },
     lastMessage:     { type: String, default: '' },
     lastMessageId:   { type: String, default: '' },
-    lastMessageFromMe: { type: Boolean, default: false },
     lastInteraction: { type: Number, default: 0 }, // unix timestamp (seconds)
-    lastOpened:     { type: Number, default: 0 }, // unix timestamp — updated when user opens the chat
     isActive:  { type: Boolean, default: true },
-    pinned:    { type: Boolean, default: false },
 }, { timestamps: true });
 
-ChatSchema.index({ clientId: 1, pinned: -1, lastOpened: -1, lastInteraction: -1 });
+ChatSchema.index({ clientId: 1, lastInteraction: -1 });
 
 module.exports = mongoose.model('Chat', ChatSchema);

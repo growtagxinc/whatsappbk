@@ -20,7 +20,6 @@ const SessionSchema = new mongoose.Schema({
 
     // Onboarding Step 1: WhatsApp connection state
     whatsappConnected: { type: Boolean, default: false },
-    whatsappWid: { type: String, default: '' }, // WhatsApp JID e.g. "9198178081629@c.us"
     connectionType: { type: String, default: null }, // 'qr', 'email_otp', 'meta_cloud'
     connectionMethod: { type: String, default: null }, // alias for connectionType
 
@@ -31,18 +30,6 @@ const SessionSchema = new mongoose.Schema({
     businessName: { type: String, default: '' },
     businessDescription: { type: String, default: '' },
     businessWebsite: { type: String, default: '' },
-
-    // ── Convenience mirrors of canonical User/Org/Workspace fields ──
-    // Canonical: User.phone
-    phone: { type: String, default: '' },
-    // Canonical: Organisation.name
-    company: { type: String, default: '' },
-    // Canonical: Workspace.sector
-    sector: { type: String, default: '' },
-    // Canonical: Workspace.vertical
-    vertical: { type: String, default: '' },
-    // Canonical: Workspace.name
-    workspaceName: { type: String, default: '' },
 
     // ── Multi-tenant migration fields ──────────────────────
     // Populated by lazy migration when existing users log in

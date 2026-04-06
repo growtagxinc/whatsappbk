@@ -1,5 +1,6 @@
 const { Worker } = require('bullmq');
 const { connection, throttledWarn } = require('./queue');
+const { sendMessage } = require('./whatsapp-cloud');
 const mongoose = require('mongoose');
 const { sanitizeAIInput } = require('../../ai/sanitize');
 
@@ -93,8 +94,11 @@ Respond in JSON format: {"response": "your reply here"}`;
         const parsed = JSON.parse(completion.choices[0].message.content);
 
         if (parsed.response) {
-            // AI response logged — Baileys handles outbound via sendSafeReply in WhatsAppManager
-            console.log(`✅ AI Response ready for ${from}: ${parsed.response.substring(0, 50)}...`);
+            await sendMessage(from, parsed.response, {
+                metaToken: config.metaToken,
+                metaPhoneNumberId: config.metaPhoneNumberId
+            });
+            console.log(`✅ AI Response sent to ${from}`);
         }
     } catch (error) {
         console.error(`❌ Worker Error [Job ${job.id}]:`, error.message);
