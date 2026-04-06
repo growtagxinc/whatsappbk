@@ -816,7 +816,7 @@ class WhatsAppManager {
      * Disconnect and clean up a client entirely (logout + delete auth files).
      */
     async destroySession(clientId) {
-        await this._pruneClient(clientId, keepAuth = false);
+        await this._pruneClient(clientId, false);
         pendingMessages.delete(clientId);
         lastActivity.delete(clientId);
         linkFailures.delete(clientId);
