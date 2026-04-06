@@ -134,6 +134,7 @@ jobs:
               --name concertos-whatsapp-new \
               --restart always \
               --env-file .env.prod \
+              --network brandpro-project_default \
               -p 80:3000 \
               -v concertos-wwebjs:/app/.wwebjs_auth \
               -v concertos-logs:/app/logs \
