@@ -1,6 +1,4 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode');
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -18,9 +16,9 @@ const bcrypt = require('bcryptjs');
 const { sanitizeAIInput } = require('./ai/sanitize');
 
 // ── WhatsApp Connection Mode ───────────────────────────────────
-// USE_BAILEYS=true → Baileys WebSocket mode (QR code, anti-ban protocol)
-// USE_BAILEYS=false → Legacy whatsapp-web.js (Puppeteer/Chromium mode)
-const USE_BAILEYS = process.env.USE_BAILEYS !== 'false';
+// Always uses Baileys WebSocket mode (QR code, anti-ban protocol, no Chromium)
+// Puppeteer/whatsapp-web.js has been removed.
+const USE_BAILEYS = true;
 
 // ── Rate Limiter: Outbound WhatsApp Messages ──────────────────
 // Limits how many messages a client can send per window.
@@ -70,17 +68,35 @@ console.log('📍 WORKING DIR:', process.cwd());
 console.log('📍 TARGET PORT:', process.env.PORT || 80);
 console.log('--------------------------------------------------');
 
-const { processMessage, determineIntent } = require('./ai/ai-router');
-const { handleVision } = require('./ai/vision');
-const { getConfig, updateConfig } = require('./ai/agents');
+let processMessage, determineIntent, handleVision, getConfig, updateConfig;
+try {
+    ({ processMessage, determineIntent } = require('./ai/ai-router'));
+} catch (e) {
+    console.warn('⚠️ AI router unavailable:', e.code);
+    processMessage = determineIntent = async () => ({ type: 'unknown', confidence: 0 });
+}
+try {
+    ({ handleVision } = require('./ai/vision'));
+} catch (e) {
+    handleVision = async () => null;
+}
+try {
+    ({ getConfig, updateConfig } = require('./ai/agents'));
+} catch (e) {
+    getConfig = updateConfig = async () => null;
+}
 let auditProfile;
 try {
     auditProfile = require('./ai/audit').auditProfile;
 } catch (e) {
-    console.warn('⚠️ Audit module unavailable (puppeteer removed). Stubbing...');
     auditProfile = async () => ({ success: false, data: null });
 }
-const { safeJsonParse } = require('./ai/utils');
+let safeJsonParse;
+try {
+    ({ safeJsonParse } = require('./ai/utils'));
+} catch (e) {
+    safeJsonParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+}
 
 const app = express();
 const allowedOrigins = [
@@ -142,64 +158,12 @@ app.get('/api/profiles', (req, res, next) => {
         const session = await Session.findOne({ clientId: userId });
         if (!session) return res.json({ session: { status: 'DISCONNECTED', authenticated: false, qr: null } });
 
-        // Also check if any ws_ session for the same phone or whatsappWid is WhatsApp-connected
-        // This catches the case where WhatsApp is connected but the usr_ session wasn't updated
-        if (!session.whatsappConnected && (session.phone || session.whatsappWid)) {
-            const waSession = await Session.findOne({
-                clientId: { $regex: /^ws_/ },
-                whatsappConnected: true,
-                $or: [
-                    session.phone ? { phone: session.phone } : null,
-                    session.whatsappWid ? { whatsappWid: { $regex: session.whatsappWid.replace('@c.us', '') } } : null
-                ].filter(Boolean)
-            }).lean();
-            if (waSession) {
-                await Session.updateOne(
-                    { clientId: userId },
-                    { $set: { whatsappConnected: true } }
-                ).catch(() => {});
-                session.whatsappConnected = true;
-            }
-        }
-
-        // Verify WhatsApp is actually connected — trust the DB flag + live client presence.
-        // ws_ is the stable connected session; usr_'s WhatsApp may be unstable.
-        // Chromium DOM inspection is fragile (WhatsApp Web UI changes break selectors),
-        // so we trust: clients.has(waClientId) means WhatsApp is running.
-        const waSession = await Session.findOne({
-            clientId: { $regex: /^ws_/ },
-            whatsappConnected: true,
-            $or: [
-                session.phone ? { phone: session.phone } : null,
-                session.whatsappWid ? { whatsappWid: { $regex: session.whatsappWid.replace('@c.us', '') } } : null
-            ].filter(Boolean)
-        }).lean();
-        const waClientId = waSession ? waSession.clientId : userId;
-
-        console.log(`[PROFILES] waSession=${waSession?.clientId} waClientId=${waClientId} clients.has=${clients.has(waClientId)} clients.size=${clients.size} userSession.whatsappConnected=${session.whatsappConnected}`);
-        // If ws_ is in DB as connected, trust it. The live client presence check
-        // (Chromium running) is enough — don't do fragile DOM inspections.
-        if (waSession && !clients.has(waClientId)) {
-            // DB says connected but no live client — update and return disconnected
-            await Session.updateOne({ clientId: waClientId }, { $set: { whatsappConnected: false, status: 'DISCONNECTED' } }).catch(() => {});
-            await Session.updateOne({ clientId: userId }, { $set: { whatsappConnected: false } }).catch(() => {});
-            // Emit socket event so frontend updates immediately (not on next 5s poll)
-            if (io) io.to(userId).emit('disconnected', 'SESSION_EXPIRED');
-            const updated = await Session.findOne({ clientId: userId });
-            return res.json({ session: updated });
-        }
-
-        // Hybrid WhatsApp status: live Baileys state is primary, DB is fallback
-        const baileysStatus = USE_BAILEYS && baileysManager
-            ? baileysManager.getStatus(userId)
-            : { status: 'NOT_INITIALIZED', connected: false };
-
+        // Baileys live status as primary, DB flag as fallback
+        const baileysStatus = baileysManager.getStatus(userId);
         res.json({
             session,
-            baileysStatus, // Live Baileys state for real-time accuracy
-            whatsappConnected: baileysStatus.connected
-                ? true
-                : session.whatsappConnected || false,
+            baileysStatus,
+            whatsappConnected: baileysStatus.connected || session.whatsappConnected || false,
         });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -232,15 +196,9 @@ app.post('/api/profiles/init', authMiddleware, async (req, res) => {
             console.log(`[Init] Cleared stale QR for ${clientId} (no auth files)`);
         }
 
-        if (USE_BAILEYS && baileysManager) {
-            // Baileys WebSocket mode — QR code streamed via Socket.io
-            await baileysManager.initializeSession(clientId).catch(err => console.error("[Baileys] Init Error:", err));
-            res.json({ success: true, message: "Baileys initializing — scan QR from dashboard" });
-        } else {
-            // whatsapp-web.js (Puppeteer) mode
-            getClient(clientId).catch(err => console.error("Init Error:", err));
-            res.json({ success: true, message: "Initializing..." });
-        }
+        // Baileys WebSocket mode — QR code streamed via Socket.io
+        await baileysManager.initializeSession(clientId).catch(err => console.error("[Baileys] Init Error:", err));
+        res.json({ success: true, message: "Baileys initializing — scan QR from dashboard" });
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -255,9 +213,7 @@ app.post('/api/profiles/logout', authMiddleware, async (req, res) => {
         }
 
         const clientId = req.userId || req.headers['x-client-id'] || 'default';
-        if (USE_BAILEYS && baileysManager) {
-            await baileysManager.destroySession(clientId);
-        }
+        await baileysManager.destroySession(clientId);
         await purgeClient(clientId);
         res.json({ success: true, message: "Disconnected successfully." });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -577,27 +533,18 @@ const { startHeartbeat } = require('./swarm/HeartbeatLoop');
 const WhatsAppManager = require('./src/services/WhatsAppManager');
 
 const clients = new Map();
-const pendingInits = new Map(); // clientId -> Promise
-
-// ── Baileys Integration ──────────────────────────────────────────────
-// Use Baileys when USE_BAILEYS=true (WebSocket mode, no Chromium/Puppeteer).
-// Falls back to whatsapp-web.js (Puppeteer) when false or unset.
+// ── Baileys Integration (WebSocket mode, no Chromium/Puppeteer) ──────
 let baileysManager = null;
+console.log('[Baileys] Initializing WhatsApp WebSocket mode (Baileys).');
+baileysManager = new WhatsAppManager(io, { queue: null });
 
-if (USE_BAILEYS) {
-    console.log('[Baileys] WebSocket mode ENABLED — Puppeteer not used.');
-    baileysManager = new WhatsAppManager(io, { queue: null });
-
-    // Wire Groq client to Baileys for AI message variability (anti-ban)
-    try {
-        const { Groq } = require('groq-sdk');
-        const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-        baileysManager.setGroqClient(groq);
-    } catch (e) {
-        console.warn('[Baileys] Groq client not available — message variability disabled.');
-    }
-} else {
-    console.log('[Baileys] WebSocket mode DISABLED — using whatsapp-web.js (Puppeteer).');
+// Wire Groq client to Baileys for AI message variability (anti-ban)
+try {
+    const { Groq } = require('groq-sdk');
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    baileysManager.setGroqClient(groq);
+} catch (e) {
+    console.warn('[Baileys] Groq client not available — message variability disabled.');
 }
 
 // ── Baileys Message & Swarm Integration ─────────────────────────────
@@ -815,182 +762,26 @@ async function upsertChat(clientId, wid, name, body, timestamp, fromMe = false, 
     }
 }
 
-// Helper to get or create a client for a specific user (QR Onboarding)
-// ── Baileys Mode: delegates to WhatsAppManager (direct WebSockets) ────────
+// Helper to initialize a Baileys session for a user
+// Delegates to WhatsAppManager which handles all WebSocket/QR logic.
 async function getClient(clientId) {
     if (!clientId) return null;
-
-    // Guard: prevent duplicate initializations (Puppeteer mode)
-    if (!USE_BAILEYS && clients.has(clientId)) {
-        const existingClient = clients.get(clientId);
-        // Sanity-check: verify Chromium is still alive before reusing.
-        // Container restart kills Chromium; dead clients must be purged so they reinitialize.
-        if (existingClient && existingClient.pupPage) {
-            try {
-                await Promise.race([
-                    existingClient.pupPage.evaluate(() => document.readyState),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('pup_dead')), 2000))
-                ]);
-                console.log(`[Puppeteer] Reusing existing client for ${clientId}`);
-                return existingClient;
-            } catch (_) {
-                // Chromium is dead — purge and reinitialize
-                console.warn(`[Puppeteer] Cached client for ${clientId} is dead (Chromium gone). Purging.`);
-                clients.delete(clientId);
-                existingClient.destroy().catch(() => {});
-            }
-        } else if (existingClient) {
-            clients.delete(clientId);
-            existingClient.destroy().catch(() => {});
-        }
-    }
-    if (!USE_BAILEYS && pendingInits.has(clientId)) {
-        console.log(`[Puppeteer] Init already in progress for ${clientId}, waiting...`);
-        return pendingInits.get(clientId);
-    }
-
-    // Baileys WebSocket mode — use WhatsAppManager directly
-    if (USE_BAILEYS && baileysManager) {
-        // Implement retry mechanism with backoff for Baileys
-        let attempts = 0;
-        const maxAttempts = 3;
-        while (attempts < maxAttempts) {
-            try {
-                return await baileysManager.wakeClient(clientId);
-            } catch (err) {
-                attempts++;
-                console.warn(`[Baileys] Wake client attempt ${attempts} failed for ${clientId}:`, err.message);
-                if (attempts < maxAttempts) {
-                    // Exponential backoff: 1s, 2s, 4s
-                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempts - 1) * 1000));
-                } else {
-                    throw err; // Re-throw on final attempt
-                }
-            }
-        }
-    }
-
-    // Legacy Puppeteer mode (DEPRECATED — use Baileys instead)
-    // If already exists, return it
-    if (clients.has(clientId)) return clients.get(clientId);
-    if (pendingInits.has(clientId)) return pendingInits.get(clientId);
-
-    const initPromise = (async () => {
-        try {
-            console.log(`[DEPRECATED] Puppeteer init for: ${clientId} — prefer USE_BAILEYS=true`);
-            const dataPath = path.join(process.cwd(), '.wwebjs_auth', `session_${clientId}`);
-
-            const authPath = path.join(process.cwd(), '.wwebjs_auth', `session_${clientId}`);
-            const lockPaths = [
-                path.join(authPath, 'SingletonLock'),
-                path.join(authPath, 'Default', 'SingletonLock'),
-                path.join(authPath, 'SingletonSocket'),
-                path.join(authPath, 'DevToolsActivePort')
-            ];
-
-            const tempPathsToCheck = ['/tmp', '/private/tmp'];
-            tempPathsToCheck.forEach(tempBase => {
-                try {
-                    if (!fs.existsSync(tempBase)) return;
-                    fs.readdirSync(tempBase).forEach(f => {
-                        if (f.startsWith('wwebjs_auth_') || f.startsWith('puppeteer_dev_profile')) {
-                            try { fs.rmSync(path.join(tempBase, f), { recursive: true, force: true }); } catch(e) {}
-                        }
-                    });
-                } catch (e) {}
-            });
-            lockPaths.forEach(lp => { try { if (fs.existsSync(lp)) fs.unlinkSync(lp); } catch (e) {} });
-
-            const sessionDir = path.join(dataPath, `session-${clientId}`);
-            const defaultDir = path.join(sessionDir, 'Default');
-            try {
-                if (fs.existsSync(path.join(sessionDir, 'SingletonLock'))) fs.unlinkSync(path.join(sessionDir, 'SingletonLock'));
-                if (fs.existsSync(path.join(defaultDir, 'SingletonLock'))) fs.unlinkSync(path.join(defaultDir, 'SingletonLock'));
-                if (fs.existsSync(path.join(sessionDir, 'SingletonCookie'))) fs.unlinkSync(path.join(sessionDir, 'SingletonCookie'));
-                if (fs.existsSync(path.join(defaultDir, 'SingletonCookie'))) fs.unlinkSync(path.join(defaultDir, 'SingletonCookie'));
-            } catch (e) { /* ignore */ }
-
-            const client = new Client({
-                authStrategy: new LocalAuth({ clientId, dataPath }),
-
-                puppeteer: {
-                    headless: 'new',
-                    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-                    args: [
-                        '--no-sandbox', '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas',
-                        '--no-first-run', '--no-zygote', '--disable-gpu'
-                    ]
-                }
-            });
-
-            clients.set(clientId, client);
-            setupClientListeners(clientId, client);
-            client.idleTimer = setTimeout(async () => {
-                console.log(`[DEPRECATED] Puppeteer idle timeout — use Baileys mode instead`);
-                await client.destroy();
-                clients.delete(clientId);
-            }, 30 * 60 * 1000);
-
-            await client.initialize().catch(async err => {
-                const errMsg = err.message || '';
-                if (errMsg.includes('already running') || errMsg.includes('profile appears to be in use') || errMsg.includes('Code: 21') || errMsg.includes('LifecycleWatcher disposed')) {
-                    console.warn(`⚠️ Session corrupted (${errMsg.substring(0, 60)}). Wiping session dir and retrying for ${clientId}...`);
-                    // Destroy current client and wipe session dir
-                    try { client.destroy(); } catch (_) {}
-                    clients.delete(clientId);
-                    try { require('fs').rmSync(dataPath, { recursive: true, force: true }); } catch (_) {}
-                    // Create a completely fresh client
-                    const newClient = new Client({
-                        authStrategy: new LocalAuth({ clientId, dataPath }),
-                        puppeteer: {
-                            headless: 'new',
-                            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote', '--disable-gpu']
-                        }
-                    });
-                    clients.set(clientId, newClient);
-                    setupClientListeners(clientId, newClient);
-                    await newClient.initialize();
-                    return;
-                }
-                throw err;
-            });
-            return clients.get(clientId);
-        } catch (err) {
-            console.error(`❌ Client Init Fail [${clientId}]:`, err);
-            pendingInits.delete(clientId);
-            throw err;
-        }
-    })();
-
-    pendingInits.set(clientId, initPromise);
-    const result = await initPromise;
-    pendingInits.delete(clientId);
-    return result;
+    return await baileysManager.wakeClient(clientId);
 }
 
 async function purgeClient(clientId) {
     if (!clientId) return;
     console.log(`🧹 FULL PURGE: ${clientId}`);
     try {
-        // 1. Destroy the in-memory client
-        const client = clients.get(clientId);
-        if (client) {
-            clearTimeout(client.idleTimer);
-            try {
-                await client.destroy();
-            } catch (e) {
-                console.warn(`⚠️ Error destroying client ${clientId}:`, e.message);
-            }
-            clients.delete(clientId);
-        }
-        
-        // 2. Nuke the entire session directory (clean slate for re-link)
-        const sessionDir = path.join(process.cwd(), '.wwebjs_auth', `session_${clientId}`);
+        // 1. Destroy Baileys session
+        await baileysManager.destroySession(clientId);
+
+        // 2. Nuke the Baileys auth session directory (clean slate for re-link)
+        const sessionDir = path.join(process.cwd(), 'sessions', clientId);
         if (fs.existsSync(sessionDir)) {
             try {
                 fs.rmSync(sessionDir, { recursive: true, force: true });
-                console.log(`🗑️ Session directory deleted: session_${clientId}`);
+                console.log(`🗑️ Session directory deleted: ${clientId}`);
             } catch (e) {
                 console.warn(`⚠️ Failed to delete session dir:`, e.message);
             }
@@ -1058,233 +849,7 @@ mongoose.connection.once('connected', () => {
 });
 
 
-function setupClientListeners(clientId, client) {
-    client.on('qr', async (qr) => {
-        const url = await qrcode.toDataURL(qr);
-        // Append unique timestamp to prevent caching artifacts
-        const freshUrl = `${url}#t=${Date.now()}`;
-        await updateSessionState(clientId, { status: 'UNAUTHENTICATED', qr: freshUrl });
-        console.log(`📲 QR Code Generated for ${clientId} (len: ${url.length})`);
-        io.to(clientId).emit('qr', freshUrl);
-    });
-
-    client.on('authenticated', async () => {
-        const info = client.info || {};
-        const waWid = info.wid?._serialized || '';
-        await updateSessionState(clientId, {
-            authenticated: true,
-            status: 'AUTHENTICATED',
-            whatsappConnected: true,
-            qr: null,
-            phone: info.wid?.user || '',
-            whatsappWid: waWid
-        });
-        console.log(`🔒 Identity Verified for ${clientId}`);
-    });
-
-    client.on('ready', async () => {
-        const info = client.info || {};
-        const waWid = info.wid?._serialized || '';
-        await updateSessionState(clientId, {
-            status: 'READY',
-            authenticated: true,
-            whatsappConnected: true,
-            qr: null,
-            displayName: info.pushname || '',
-            phone: info.wid?.user || '',
-            whatsappWid: waWid
-        });
-        // Sync whatsappConnected=true to all user sessions sharing the same WhatsApp phone.
-        // Also find and update the usr_ session directly (it may not have phone set).
-        const waPhone = info.wid?.user || '';
-        if (waPhone || waWid) {
-            await Session.updateMany(
-                { clientId: { $ne: clientId }, phone: waPhone },
-                { $set: { whatsappConnected: true, lastActive: new Date() } }
-            ).catch(() => {});
-        }
-        // Also update the companion usr_ session directly (different clientId prefix)
-        // by finding sessions in the same org that don't have ws_ prefix
-        if (clientId.startsWith('ws_')) {
-            const usrSession = await Session.findOne({
-                clientId: { $regex: /^usr_/ },
-                whatsappConnected: { $ne: true }
-            }).lean();
-            if (usrSession) {
-                await Session.updateOne(
-                    { _id: usrSession._id },
-                    { $set: { whatsappConnected: true, phone: waPhone || '', whatsappWid: waWid, lastActive: new Date() } }
-                ).catch(() => {});
-            }
-        }
-
-        console.log(`✅ DASHBOARD READY for ${clientId}`);
-
-        // Auto-Initialize Cognitive Swarm for this client
-        try {
-            const swarm = require('./swarm/SwarmManager').getSwarmManager(io);
-            await swarm.initializeSwarm(clientId);
-        } catch (err) {
-            console.error(`[SWARM] Auto-init failed to initialize agents for ${clientId}:`, err.message);
-        }
-        
-        io.to(clientId).emit('ready', 'Connected');
-
-        // Heartbeat: verify WhatsApp Web page is still connected every 60s
-        // WhatsApp Web shows "Phone not connected" or QR when session expires
-        const pupPage = client.pupPage;
-        if (!client._waHeartbeatInterval && pupPage) {
-            client._waHeartbeatInterval = setInterval(async () => {
-                try {
-                    const isStillConnected = await pupPage.evaluate(() => {
-                        const text = document.body ? (document.body.innerText || '') : '';
-                        const hasQR = document.querySelector('.qr-login-container, [data-ref="qr-code"]');
-                        const hasPhoneNotConnected = text.includes('phone is not connected') || text.includes('connect your phone');
-                        return !hasQR && !hasPhoneNotConnected;
-                    }).catch(() => true);
-                    if (!isStillConnected) {
-                        console.warn(`[Heartbeat] WhatsApp Web session expired for ${clientId} — triggering disconnect`);
-                        client.emit('disconnected', 'SESSION_EXPIRED');
-                    }
-                } catch (e) { /* ignore */ }
-            }, 60000);
-        }
-    });
-
-    client.on('auth_failure', async msg => {
-        console.warn(`🛑 Auth Failure [${clientId}]: ${msg}`);
-        await updateSessionState(clientId, { status: 'AUTH_FAILURE', qr: null, authenticated: false });
-        io.to(clientId).emit('error', 'Auth failure: ' + msg);
-        setTimeout(() => purgeClient(clientId), 500);
-    });
-
-    client.on('disconnected', async (reason) => {
-        console.warn(`🔌 Disconnected [${clientId}]: ${reason}`);
-        // Only mark as DISCONNECTED if the heartbeat confirmed a real session expiry.
-        // Puppeteer fires 'disconnected' during normal session restore — heartbeat
-        // is the authoritative source of truth for real disconnects (emits SESSION_EXPIRED).
-        const isRealDisconnect = reason === 'SESSION_EXPIRED';
-        const updates = { authenticated: false };
-        if (isRealDisconnect) {
-            updates.status = 'DISCONNECTED';
-            updates.whatsappConnected = false;
-        }
-        await updateSessionState(clientId, updates);
-        io.to(clientId).emit('disconnected', reason);
-        if (isRealDisconnect) {
-            setTimeout(() => purgeClient(clientId), 500);
-        }
-    });
-
-    client.on('message', async msg => {
-        // RESET IDLE TIMER on activity
-        clearTimeout(client.idleTimer);
-        client.idleTimer = setTimeout(async () => {
-            console.log(`💤 Hibernating idle client: ${clientId}`);
-            await client.destroy();
-            clients.delete(clientId);
-        }, 30 * 60 * 1000);
-
-        // Emit to dashboard for real-time display
-        io.to(clientId).emit('message', {
-            id: msg.id._serialized,
-            from: msg.from,
-            to: msg.to,
-            body: msg.body,
-            fromMe: msg.fromMe,
-            timestamp: msg.timestamp
-        });
-
-        // Persist chat metadata to MongoDB for inbox
-        const contactName = msg.notifyName || msg._data?.notifyName || msg.from.replace('@c.us', '').replace('@g.us', '');
-        await upsertChat(clientId, msg.from, contactName, msg.body, msg.timestamp, false);
-
-        const chatId = msg.from;
-        
-        // Persistent AI Pause Check
-        const isPaused = await getChatState(clientId, chatId);
-        if (isPaused) return;
-        
-        // ═══ SWARM v2.0: Post to Blackboard instead of direct AI call ═══
-        try {
-            const swarm = getSwarmManager(io);
-            
-            let imageBase64 = null;
-            if (msg.hasMedia && msg.type === 'image') {
-                try {
-                    const media = await msg.downloadMedia();
-                    if (media) imageBase64 = `data:${media.mimetype};base64,${media.data}`;
-                } catch (e) {}
-            }
-
-            await swarm.postSignal('INBOUND_MESSAGE', {
-                from: chatId,
-                body: msg.body,
-                hasMedia: msg.hasMedia,
-                mediaType: msg.type,
-                imageBase64,
-                timestamp: msg.timestamp,
-                messageId: msg.id._serialized
-            }, clientId, {
-                source: 'whatsapp',
-                sourceId: msg.id._serialized
-            });
-
-            // NOTE: The signal is now on the Blackboard.
-            // The SwarmManager auto-routes it to the appropriate agent.
-            // The HeartbeatLoop catches any stale unprocessed signals.
-            
-            // LEGACY FALLBACK: If no agents are configured yet,
-            // fall back to direct AI processing
-            const agentCount = await AgentState.countDocuments({ clientId });
-            if (agentCount === 0) {
-                const aiReply = await processMessage(msg.body, imageBase64);
-                if (aiReply && aiReply.intent === 'HANDOFF_HUMAN') {
-                    await Lead.findOneAndUpdate(
-                        { clientId, phone: chatId.replace('@c.us', '') },
-                        { isAiPaused: true },
-                        { upsert: true }
-                    );
-                    io.to(clientId).emit('human_handoff', chatId);
-                } else if (aiReply && aiReply.response) {
-                    await client.sendMessage(chatId, aiReply.response);
-                    await upsertChat(clientId, chatId, '', aiReply.response, Math.floor(Date.now() / 1000), true);
-                }
-            }
-        } catch (err) {
-            console.error(`[SWARM] Error posting signal for ${chatId}:`, err.message);
-        }
-    });
-
-    client.on('message_create', async msg => {
-        if (msg.fromMe) {
-            // Auto-pause AI when human replies
-            await Lead.findOneAndUpdate(
-                { clientId, phone: msg.to.replace('@c.us', '') },
-                { isAiPaused: true },
-                { upsert: true }
-            );
-            
-            io.to(clientId).emit('message', {
-                id: msg.id._serialized,
-                from: msg.from,
-                to: msg.to,
-                body: msg.body,
-                fromMe: msg.fromMe,
-                timestamp: msg.timestamp
-            });
-        }
-    });
-
-    client.on('message_edit', (msg, newBody, prevBody) => {
-        io.to(clientId).emit('message_edit', {
-            id: msg.id._serialized,
-            chatId: msg.to || msg.from,
-            newBody: newBody,
-            prevBody: prevBody
-        });
-    });
-}
+// Puppeteer/whatsapp-web.js has been fully removed. WhatsAppManager handles all events.
 
 
 
@@ -1321,17 +886,8 @@ app.use(async (req, res, next) => {
     req.workspaceId = req.headers['x-workspace-id'] || decoded.workspaceId || null;
     req.clientId = req.userId;
 
-    // WhatsApp clients are stored by userId in WhatsAppManager — wait for client to be resolved
-    if (!req.userId) {
-        req.whatsapp = null;
-        return next();
-    }
-    try {
-        req.whatsapp = await getClient(req.userId);
-    } catch (err) {
-        req.whatsapp = null;
-    }
-
+    // Baileys session is lazily initialized by routes that need it — no pre-loading here.
+    req.whatsapp = null;
     next();
 });
 // ─────────────────────────────────────────────────────────
@@ -1369,7 +925,7 @@ app.get('/health', async (req, res) => {
             whatsapp: whatsappStatus,
             hasActiveQR: !!(session && session.qr),
             userName: null,
-            isLoaded: !!clients.get(clientId),
+            isLoaded: !!baileysManager.getStatus(clientId)?.socket,
             paperclip: false,
             baileys: USE_BAILEYS ? baileysManager?.getStatus(clientId) : null,
         });
@@ -1380,99 +936,31 @@ app.get('/health', async (req, res) => {
 
 app.get('/api/chats', async (req, res) => {
     try {
-        if (mongoose.connection.readyState !== 1) {
-            return res.json({ chats: [], whatsappStatus: 'DISCONNECTED' });
-        }
-
         const userId = req.userId;
-        const session = await Session.findOne({ clientId: userId }).lean();
-        const status = session ? session.status : 'AUTHENTICATING';
-
-        // Resolve ws_ session for WhatsApp operations
-        const phone = session?.phone;
-        let waClientId = userId;
-        if (phone) {
-            const waSession = await Session.findOne({
-                clientId: { $regex: /^ws_/ },
-                $or: [
-                    { phone: phone },
-                    { whatsappWid: { $regex: phone + '@' } }
-                ],
-                whatsappConnected: true
-            }).lean();
-            if (waSession) waClientId = waSession.clientId;
-        }
-
-        const client = await getClient(waClientId);
-
-        if (!client || status !== 'READY') {
-             return res.json({ chats: [], whatsappStatus: status });
-        }
-
-        let chats = [];
-        try {
-            chats = await client.getChats();
-        } catch (e) {
-            console.warn(`[${waClientId}] getChats failed despite READY status:`, e.message);
-            return res.json({ chats: [], whatsappStatus: 'CONNECTING' });
-        }
-
-        const enriched = chats.map((chat) => ({
-            id: chat.id._serialized,
-            name: chat.name,
-            unreadCount: chat.unreadCount,
-            lastMessage: chat.lastMessage ? chat.lastMessage.body : '',
-            profilePic: null,
-            pinned: !!chat.pinned
-        }));
+        const baileysStatus = baileysManager.getStatus(userId);
+        const chats = await Chat.find({ clientId: userId, isActive: true })
+            .sort({ lastMessageAt: -1 }).limit(50).lean();
         res.json({
-            chats: enriched,
-            whatsappStatus: 'CONNECTED',
-            phone: client.info?.wid?.user || '',
-            pushname: client.info?.pushname || ''
+            chats: chats.map(c => ({
+                id: c.wid,
+                name: c.name || c.wid?.replace('@c.us', '').replace('@g.us', ''),
+                unreadCount: 0,
+                lastMessage: c.lastMessage || '',
+                profilePic: null,
+                pinned: !!c.isPinned
+            })),
+            whatsappStatus: baileysStatus.connected ? 'CONNECTED' : 'DISCONNECTED',
+            phone: baileysStatus.phone || '',
+            pushname: baileysStatus.pushname || ''
         });
     } catch (err) {
-        res.json({ chats: [], whatsappStatus: 'CONNECTED', error: err.message });
+        res.json({ chats: [], whatsappStatus: 'DISCONNECTED', error: err.message });
     }
 });
-
 // Mark chat messages as read
 app.post('/api/chats/:id/read', async (req, res) => {
-    const userId = req.userId;
-    try {
-        // Resolve ws_ session for WhatsApp operations
-        const session = await Session.findOne({ clientId: userId }).lean();
-        const phone = session?.phone;
-        let waClientId = userId;
-        if (phone) {
-            const waSession = await Session.findOne({
-                clientId: { $regex: /^ws_/ },
-                $or: [
-                    { phone: phone },
-                    { whatsappWid: { $regex: phone + '@' } }
-                ],
-                whatsappConnected: true
-            }).lean();
-            if (waSession) waClientId = waSession.clientId;
-        }
-
-        const client = await getClient(waClientId);
-        if (!client) return res.status(503).json({ error: "WhatsApp not ready" });
-
-        const chat = await client.getChatById(req.params.id);
-        await chat.sendSeen();
-
-        // Clear unread count in MongoDB so UI reflects read state
-        const wid = req.params.id;
-        await Chat.updateOne(
-            { clientId: waClientId, wid },
-            { $set: { unread: 0 } }
-        ).catch(() => {});
-
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    res.status(503).json({ error: "Mark as read not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
-
 // Deprecated GET /api/chats/:id/messages — use /api/inbox/whatsapp/:id/messages instead
 // (Frontend already uses the inbox endpoint; this is kept for backwards compat)
 app.get('/api/chats/:id/messages', async (req, res) => {
@@ -1484,37 +972,10 @@ app.get('/api/chats/:id/messages', async (req, res) => {
 
 
 app.post('/api/chats/:id/messages', messageRateLimiter, async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not ready" });
     try {
         const { text, quotedMsgId } = req.body;
         if (!text) return res.status(400).json({ error: "Message text required" });
-
-        const options = {};
-        if (quotedMsgId) {
-            // Fetch the message to reply to
-            try {
-                const chat = await client.getChatById(req.params.id);
-                const allMsgs = await chat.fetchMessages({ limit: 100 });
-                const quotedMsg = allMsgs.find(m => m.id._serialized === quotedMsgId);
-                if (quotedMsg) {
-                    // Build ChatMessage to reply to
-                    const { Chat, Message } = require('/app/node_modules/whatsapp-web.js');
-                    const quoted = Message.createFromData(quotedMsg);
-                    options['quotedMessageId'] = quotedMsgId;
-                }
-            } catch(e) {
-                console.log(`[Send] Could not find quoted message ${quotedMsgId}: ${e.message}`);
-            }
-        }
-
-        if (USE_BAILEYS && baileysManager) {
-            await baileysManager.sendSafeReply(req.clientId, req.params.id, text, quotedMsgId);
-        } else {
-            // whatsapp-web.js (Puppeteer) mode — sendMessage with quotedMessageId
-            await client.sendMessage(req.params.id, text, options);
-        }
-        // Persist outbound message to MongoDB for inbox
+        await baileysManager.sendSafeReply(req.clientId, req.params.id, text, quotedMsgId || null);
         await upsertChat(req.clientId, req.params.id, '', text, Math.floor(Date.now() / 1000), true);
         res.json({ success: true, timestamp: Date.now() });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1546,17 +1007,8 @@ app.get('/api/profile', authMiddleware, async (req, res) => {
             googleLinked: !!(session?.googleTokens && session?.googleTokens.access_token),
         };
 
-        const client = req.whatsapp;
-        if (client && client.info) {
-            profile.whatsappSynced = true;
-            profile.pushname = client.info.pushname;
-            profile.phone = client.info.wid?.user;  // WhatsApp-specific phone overrides
-        }
-
         // Baileys mode: add WebSocket session info
-        if (USE_BAILEYS && baileysManager) {
-            profile.baileys = baileysManager.getStatus(userId);
-        }
+        profile.baileys = baileysManager.getStatus(userId);
 
         res.json(profile);
     } catch (err) {
@@ -1592,15 +1044,9 @@ app.post('/api/profile', authMiddleware, async (req, res) => {
 });
 
 app.post('/api/messages/send', messageRateLimiter, async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not ready" });
     try {
         const { chatId, message, quotedMessageId } = req.body;
-        if (USE_BAILEYS && baileysManager) {
-            await baileysManager.sendSafeReply(req.clientId, chatId, message, { quotedKey: quotedMessageId });
-        } else {
-            await client.sendMessage(chatId, message, { quotedMessageId });
-        }
+        await baileysManager.sendSafeReply(req.clientId, chatId, message, quotedMessageId || null);
         await upsertChat(req.clientId, chatId, '', message, Math.floor(Date.now() / 1000), true);
         res.json({ success: true, timestamp: Date.now() });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1608,224 +1054,37 @@ app.post('/api/messages/send', messageRateLimiter, async (req, res) => {
 
 // DELETE /api/chats/:id/messages/:msgId — Delete for everyone
 app.delete('/api/chats/:id/messages/:msgId', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not connected" });
-    try {
-        const chat = await client.getChatById(req.params.id);
-        const messages = await chat.fetchMessages({ limit: 200 });
-        const msg = messages.find(m => m.id._serialized === req.params.msgId);
-        if (!msg) return res.status(404).json({ error: "Message not found", code: 'MSG_NOT_FOUND' });
-        if (!msg.fromMe) return res.status(403).json({ error: "Can only delete your own messages", code: 'NOT_YOUR_MESSAGE' });
-        await msg.delete(true);
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: "Failed to delete message", code: 'DELETE_FAILED' }); }
+    res.status(503).json({ error: "Delete message not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 // PUT /api/chats/:id/messages/:msgId — Edit sent message (within ~15 min window)
 app.put('/api/chats/:id/messages/:msgId', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not connected" });
-    try {
-        const { text } = req.body;
-        if (!text) return res.status(400).json({ error: "Message text required", code: 'MISSING_TEXT' });
-        const chat = await client.getChatById(req.params.id);
-        const messages = await chat.fetchMessages({ limit: 200 });
-        const msg = messages.find(m => m.id._serialized === req.params.msgId);
-        if (!msg) return res.status(404).json({ error: "Message not found or too old", code: 'MSG_NOT_FOUND' });
-        if (!msg.fromMe) return res.status(403).json({ error: "Can only edit your own messages", code: 'NOT_YOUR_MESSAGE' });
-
-        // Time-window check: WhatsApp only allows edits within ~15 minutes
-        const nowSecs = Math.floor(Date.now() / 1000);
-        if ((nowSecs - msg.timestamp) > 15 * 60) {
-            return res.status(410).json({ error: "Edit window has expired (15 min)", code: 'EDIT_WINDOW_EXPIRED' });
-        }
-
-        await msg.edit(text);
-        res.json({ success: true });
-    } catch (err) {
-        const msg = err.message || '';
-        if (msg.includes('too old') || msg.includes('cannot be edited') || msg.includes('81002')) {
-            return res.status(410).json({ error: "Edit window has expired", code: 'EDIT_WINDOW_EXPIRED' });
-        }
-        res.status(500).json({ error: err.message, code: 'EDIT_FAILED' });
-    }
+    res.status(503).json({ error: "Edit message not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 // POST /api/chats/:id/messages/:msgId/star — Star or unstar a message
 app.post('/api/chats/:id/messages/:msgId/star', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not connected" });
-    try {
-        const chat = await client.getChatById(req.params.id);
-        const messages = await chat.fetchMessages({ limit: 200 });
-        const msg = messages.find(m => m.id._serialized === req.params.msgId);
-        if (!msg) return res.status(404).json({ error: "Message not found", code: 'MSG_NOT_FOUND' });
-        const isStarred = !!(msg._data?.star);
-        if (isStarred) {
-            await msg.unstar();
-        } else {
-            await msg.star();
-        }
-        res.json({ success: true, isStarred: !isStarred });
-    } catch (err) { res.status(500).json({ error: "Failed to star message", code: 'STAR_FAILED' }); }
+    res.status(503).json({ error: "Star message not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 // POST /api/chats/:id/messages/:msgId/react — React to a message with emoji
 app.post('/api/chats/:id/messages/:msgId/react', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not connected" });
-    try {
-        const { emoji } = req.body;
-        const chat = await client.getChatById(req.params.id);
-        const messages = await chat.fetchMessages({ limit: 200 });
-        const msg = messages.find(m => m.id._serialized === req.params.msgId);
-        if (!msg) return res.status(404).json({ error: "Message not found", code: 'MSG_NOT_FOUND' });
-        await msg.react(emoji || '👍');
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: "Failed to react", code: 'REACT_FAILED' }); }
+    res.status(503).json({ error: "React to message not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 // POST /api/chats/:id/forward — Forward one or more messages to one or more chats
 app.post('/api/chats/:id/forward', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not connected" });
-    try {
-        const { messageIds, targetChatIds } = req.body;
-        if (!messageIds?.length || !targetChatIds?.length) {
-            return res.status(400).json({ error: "Select at least one message and one chat", code: 'MISSING_SELECTION' });
-        }
-        if (targetChatIds.length > 5) {
-            return res.status(400).json({ error: "Maximum 5 chats at a time", code: 'TOO_MANY_TARGETS' });
-        }
-        const sourceChat = await client.getChatById(req.params.id);
-        const allMsgs = await sourceChat.fetchMessages({ limit: 200 });
-        const toForward = allMsgs.filter(m => messageIds.includes(m.id._serialized));
-        if (!toForward.length) return res.status(404).json({ error: "Messages not found", code: 'MSGS_NOT_FOUND' });
-
-        const results = [];
-        for (const targetId of targetChatIds) {
-            try {
-                for (const msg of toForward) {
-                    await client.forwardMessage(targetId, msg);
-                }
-                results.push({ chatId: targetId, success: true });
-            } catch(e) {
-                results.push({ chatId: targetId, success: false, error: e.message });
-            }
-        }
-        const failed = results.filter(r => !r.success).length;
-        res.json({
-            success: failed === 0,
-            partial: failed > 0 && failed < targetChatIds.length,
-            results
-        });
-    } catch (err) { res.status(500).json({ error: "Failed to forward", code: 'FORWARD_FAILED' }); }
+    res.status(503).json({ error: "Forward message not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 // PATCH /api/chats/:id — Update chat settings (archive, mute, pin, mark unread)
 app.patch('/api/chats/:id', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not ready" });
-    try {
-        const { archive, mute, pin, markUnread } = req.body;
-        const chat = await client.getChatById(req.params.id);
-        if (archive !== undefined) await chat.archive(archive);
-        if (mute !== undefined) {
-            if (mute === 0) await chat.unmute();
-            else await chat.mute(mute); // mute takes a Duration
-        }
-        if (pin !== undefined) await chat.pin(pin);
-        if (markUnread !== undefined) {
-            if (markUnread) await chat.sendSeen(false);
-            // Note: sendSeen(false) marks as unread in wweb.js
-        }
-        // Sync back to MongoDB
-        await Chat.findOneAndUpdate(
-            { clientId: req.clientId, wid: req.params.id },
-            {
-                $set: {
-                    isActive: !archive
-                }
-            }
-        );
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    res.status(503).json({ error: "Chat settings not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 
 app.post('/api/chats/:id/force-ai', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not ready" });
-    try {
-        const chat = await client.getChatById(req.params.id);
-        const messages = await chat.fetchMessages({ limit: 30 });
-        const reversed = messages.reverse();
-
-        const textMessages = reversed.filter(m => !m.fromMe && m.body).map(m => m.body);
-        const imageMsgs = reversed.filter(m => !m.fromMe && m.hasMedia && m.type === 'image').slice(0, 3);
-
-        if (textMessages.length === 0 && imageMsgs.length === 0) {
-            return res.status(400).json({ error: "No user messages found to evaluate." });
-        }
-
-        // Lazy image download: one at a time with 8s timeout each, cap at 2 images
-        const downloadImg = async (msg) => {
-            return Promise.race([
-                (async () => {
-                    const media = await msg.downloadMedia();
-                    return media ? `data:${media.mimetype};base64,${media.data}` : null;
-                })(),
-                new Promise(r => setTimeout(() => r(null), 8000))
-            ]).catch(() => null);
-        };
-
-        const allImages = [];
-        for (const img of imageMsgs) {
-            const data = await downloadImg(img);
-            if (data) allImages.push(data);
-            if (allImages.length >= 2) break;
-        }
-
-        const bodyText = textMessages.length > 0 ? textMessages.slice(0, 5).join('\n---\n') : 'Evaluate profile.';
-
-        const context = await determineIntent(bodyText);
-        let auditData = null;
-        let detectedUrl = context.profileUrl;
-
-        if (!detectedUrl && allImages.length > 0) {
-            try {
-                const visionResult = await Promise.race([
-                    handleVision(allImages, "Find social profile URL."),
-                    new Promise((_, rj) => setTimeout(() => rj(new Error('vision_timeout')), 15000))
-                ]);
-                if (visionResult?.profileUrl) detectedUrl = visionResult.profileUrl;
-            } catch (_) {}
-        }
-
-        if (detectedUrl) {
-            try {
-                await client.sendMessage(chat.id._serialized, "🔍 Processing audit...");
-                const auditResult = await auditProfile(detectedUrl);
-                if (auditResult && auditResult.success) {
-                    auditData = auditResult.data;
-                    const phone = chat.id._serialized.replace('@c.us', '');
-                    await Lead.findOneAndUpdate(
-                        { phone, clientId: req.userId },
-                        { auditData, lastAuditedAt: new Date(), clientId: req.userId },
-                        { upsert: true }
-                    );
-                }
-            } catch (_) {}
-        }
-
-        const aiReply = await processMessage(bodyText, allImages.length > 0 ? allImages : null, auditData);
-        if (aiReply?.response) {
-            await client.sendMessage(chat.id._serialized, aiReply.response);
-            res.json({ success: true, aiResponse: aiReply.response });
-        } else {
-            res.status(500).json({ error: "AI failed to generate a response" });
-        }
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    res.status(503).json({ error: "Force AI not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 
@@ -3011,7 +2270,7 @@ app.get('/api/admin/overview', authMiddleware, async (req, res) => {
             const hotLeads = await Lead.countDocuments({ qualification: 'HOT' });
             const warmLeads = await Lead.countDocuments({ qualification: 'WARM' });
             const coldLeads = await Lead.countDocuments({ qualification: 'COLD' });
-            const activeClients = clients.size;
+            const activeClients = baileysManager?.getStats()?.activeClients || 0;
             const mongoStatus = mongoose.connection.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED';
             return res.json({
                 success: true,
@@ -3071,7 +2330,7 @@ app.get('/api/admin/sessions', authMiddleware, async (req, res) => {
 
         const enriched = sessions.map(s => ({
             ...s,
-            hasActiveClient: clients.has(s.clientId),
+            hasActiveClient: !!baileysManager.getStatus(s.clientId)?.socket,
         }));
         res.json({ success: true, sessions: enriched });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3348,23 +2607,9 @@ app.get('/api/inbox', async (req, res) => {
     try {
         const userId = req.userId;
 
-        // Resolve ws_ session (actual WhatsApp engine) from usr_ session
-        // Match by phone OR whatsappWid (JID like "918178081629@c.us")
+        // Baileys: WhatsApp session is the user's session directly
         const session = await Session.findOne({ clientId: userId }).lean();
-        const phone = session?.phone;
-        const whatsappWid = session?.whatsappWid;
-        let waClientId = userId;
-        if (phone || whatsappWid) {
-            const waSession = await Session.findOne({
-                clientId: { $regex: /^ws_/ },
-                whatsappConnected: true,
-                $or: [
-                    phone ? { phone } : null,
-                    whatsappWid ? { whatsappWid: { $regex: whatsappWid.replace('@c.us', '') } } : null
-                ].filter(Boolean)
-            }).lean();
-            if (waSession) waClientId = waSession.clientId;
-        }
+        const waClientId = userId;
 
         // 1. Fetch WhatsApp chats — primary (Chat model) + fallback (Signal aggregation)
         const waPromise = (async () => {
@@ -3496,100 +2741,28 @@ app.get('/api/inbox/:type/:id/messages', async (req, res) => {
         const beforeMsgId = req.query.before || null;
 
         if (type === 'whatsapp') {
-            const client = req.whatsapp || await getClient(userId);
-            if (!client) return res.status(503).json({ error: "WhatsApp not connected" });
-
-            try {
-                const chat = await client.getChatById(id);
-
-                // Build fetch options — use `before` cursor if provided
-                const fetchOpts = { limit };
-                if (beforeMsgId) {
-                    // Find the message by ID to get its timestamp as cursor
-                    const allForCursor = await chat.fetchMessages({ limit: 200 });
-                    const cursorMsg = allForCursor.find(m => m.id._serialized === beforeMsgId);
-                    if (cursorMsg) {
-                        fetchOpts['before'] = cursorMsg;
-                    }
-                }
-
-                const messages = await chat.fetchMessages(fetchOpts);
-
-                // Track "last opened" so inbox sort matches WhatsApp Web behavior
-                // (most recently opened chats bubble up, regardless of last message time)
-                await Chat.updateOne(
-                    { clientId: userId, wid: id },
-                    { $set: { lastOpened: Math.floor(Date.now() / 1000) } }
-                ).catch(() => {});
-
-                const formatted = messages.map(m => {
-                    let quotedObj = null;
-                    if (m._data?.quotedMsg) {
-                        const qm = m._data.quotedMsg;
-                        quotedObj = {
-                            id: qm.id?._serialized || qm.id,
-                            body: (qm.body || '').substring(0, 200),
-                            fromMe: qm.fromMe,
-                            author: qm.author || (qm.fromMe ? id : null),
-                            hasMedia: qm.hasMedia || false,
-                            type: qm.type || 'chat'
-                        };
-                    }
-
-                    // Check if edit is still possible (within ~15 min window)
-                    const nowSecs = Math.floor(Date.now() / 1000);
-                    const EDIT_WINDOW_SECS = 15 * 60;
-                    const canEdit = m.fromMe && (nowSecs - m.timestamp) < EDIT_WINDOW_SECS;
-
-                    return {
-                        id: m.id._serialized,
-                        fromMe: m.fromMe,
-                        body: m.body,
-                        timestamp: m.timestamp,
-                        type: m.type || 'chat',
-                        role: m.fromMe ? 'human' : 'lead',
-                        ack: m.ack ?? (m.fromMe ? 1 : 0),
-                        hasMedia: m.hasMedia,
-                        // Only expose metadata — actual download via separate endpoint
-                        mediaMimeType: m._data?.mediaData?.mimetype || null,
-                        mediaSize: m._data?.mediaData?.filesize || null,
-                        quotedMsg: quotedObj,
-                        isStarred: !!(m._data?.star),
-                        isEdited: !!(m._data?.editHistory?.length),
-                        editCount: (m._data?.editHistory?.length) || 0,
-                        canEdit
-                    };
-                });
-
-                return res.json({
-                    messages: formatted,
-                    hasMore: messages.length === limit,
-                    oldestId: messages.length > 0 ? messages[0].id._serialized : null
-                });
-            } catch (chatErr) {
-                console.log(`[Inbox/Messages] getChatById failed: ${chatErr.message}. Falling back to Signal records.`);
-                const signals = await Signal.find({
-                    clientId: userId,
-                    type: { $in: ['INBOUND_MESSAGE', 'OUTBOUND_MESSAGE'] },
-                    'payload.from': id
-                }).sort({ createdAt: -1 }).limit(limit).lean();
-                return res.json({
-                    messages: signals.map(s => ({
-                        id: s.sourceId || s._id.toString(),
-                        fromMe: s.type === 'OUTBOUND_MESSAGE',
-                        body: s.payload?.body || '',
-                        timestamp: s.payload?.timestamp || Math.floor(s.createdAt.getTime() / 1000),
-                        role: s.type === 'OUTBOUND_MESSAGE' ? 'human' : 'lead',
-                        ack: s.type === 'OUTBOUND_MESSAGE' ? (s.status === 'PENDING' ? 1 : 3) : 0,
-                        type: 'chat',
-                        hasMedia: false,
-                        canEdit: false,
-                        isStarred: false,
-                        isEdited: false
-                    })),
-                    hasMore: signals.length === limit
-                });
-            }
+            // Baileys mode: fetch messages from Signal records (message history)
+            const signals = await Signal.find({
+                clientId: userId,
+                type: { $in: ['INBOUND_MESSAGE', 'OUTBOUND_MESSAGE'] },
+                'payload.from': id
+            }).sort({ createdAt: -1 }).limit(limit).lean();
+            return res.json({
+                messages: signals.map(s => ({
+                    id: s.sourceId || s._id.toString(),
+                    fromMe: s.type === 'OUTBOUND_MESSAGE',
+                    body: s.payload?.body || '',
+                    timestamp: s.payload?.timestamp || Math.floor(s.createdAt.getTime() / 1000),
+                    role: s.type === 'OUTBOUND_MESSAGE' ? 'human' : 'lead',
+                    ack: s.type === 'OUTBOUND_MESSAGE' ? (s.status === 'PENDING' ? 1 : 3) : 0,
+                    type: 'chat',
+                    hasMedia: false,
+                    canEdit: false,
+                    isStarred: false,
+                    isEdited: false
+                })),
+                hasMore: signals.length === limit
+            });
         } else if (type === 'email') {
             const messages = await getGmailThreadMessages(userId, id);
             return res.json({ messages, hasMore: false });
@@ -3600,71 +2773,17 @@ app.get('/api/inbox/:type/:id/messages', async (req, res) => {
 });
 
 // ── GET /api/chats/:id/messages/:msgId/media ──────────────────────────────────
-// Lazy download of a single message's media (avoids downloading all media eagerly)
 app.get('/api/chats/:id/messages/:msgId/media', async (req, res) => {
-    const client = req.whatsapp || await getClient(req.userId);
-    if (!client) return res.status(503).json({ error: "WhatsApp not connected" });
-    try {
-        const chat = await client.getChatById(req.params.id);
-        const allMsgs = await chat.fetchMessages({ limit: 200 });
-        const msg = allMsgs.find(m => m.id._serialized === req.params.msgId);
-        if (!msg) return res.status(404).json({ error: "Message not found" });
-        if (!msg.hasMedia) return res.status(404).json({ error: "No media in this message" });
-
-        const media = await msg.downloadMedia();
-        if (!media) return res.status(404).json({ error: "Failed to download media" });
-
-        const b64 = media.data;
-        const buf = Buffer.from(b64, 'base64');
-        res.set('Content-Type', media.mimetype);
-        res.set('Content-Disposition', `inline; filename="media.${media.mimetype.split('/')[1]}"`);
-        res.set('Content-Length', buf.length);
-        res.send(buf);
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    res.status(503).json({ error: "Media download not yet implemented in Baileys mode", code: 'NOT_IMPLEMENTED' });
 });
 
 app.post('/api/chats/sync', async (req, res) => {
     try {
         const userId = req.userId;
-
-        // Resolve ws_ session for WhatsApp operations
-        const session = await Session.findOne({ clientId: userId }).lean();
-        const phone = session?.phone;
-        let waClientId = userId;
-        if (phone) {
-            const waSession = await Session.findOne({
-                clientId: { $regex: /^ws_/ },
-                $or: [
-                    { phone: phone },
-                    { whatsappWid: { $regex: phone + '@' } }
-                ],
-                whatsappConnected: true
-            }).lean();
-            if (waSession) waClientId = waSession.clientId;
-        }
-
-        const client = await getClient(waClientId);
-        if (!client) {
-            return res.status(404).json({ error: "WhatsApp client not found. Please reconnect." });
-        }
-        try {
-            const chats = await client.getChats();
-            // Seed Chat model from WhatsApp (for historical chats)
-            await Promise.all(chats.map(c => {
-                const wid = c.id?._serialized || c.id;
-                return upsertChat(waClientId, wid, c.name, c.lastMessage?.body, c.timestamp, false, !!c.pinned);
-            }));
-            res.json({ success: true, count: chats.length });
-        } catch (getChatsErr) {
-            // Puppeteer fallback: return count from Chat model
-            const count = await Chat.countDocuments({ clientId: waClientId, isActive: true });
-            console.log(`[Chats Sync] getChats() failed: ${getChatsErr.message}. Returning ${count} from DB.`);
-            res.json({ success: true, count, source: 'db' });
-        }
-    } catch (err) {
-        console.error(`[Chats Sync] Error for userId=${req.userId}:`, err.message);
-        res.status(500).json({ error: err.message });
-    }
+        // Baileys: sync chats from DB (WhatsAppManager seeds Chat model on message receipt)
+        const count = await Chat.countDocuments({ clientId: userId, isActive: true });
+        res.json({ success: true, count, source: 'db' });
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -3710,41 +2829,18 @@ io.on('connection', (socket) => {
         socket.join(clientId);
         console.log(`👤 Client joined room: ${clientId}`);
 
-        // Find the best session to report WhatsApp status from.
-        // Priority: ws_ (actual WhatsApp engine) > usr_ (user identity session)
-        let waClientId = clientId;
-        const userSession = await Session.findOne({ clientId });
-        if (userSession) {
-            const phone = userSession.phone;
-            const whatsappWid = userSession.whatsappWid;
-            if (phone || whatsappWid) {
-                const waSession = await Session.findOne({
-                    clientId: { $regex: /^ws_/ },
-                    whatsappConnected: true,
-                    $or: [
-                        phone ? { phone } : null,
-                        whatsappWid ? { whatsappWid: { $regex: whatsappWid.replace('@c.us', '') } } : null
-                    ].filter(Boolean)
-                }).lean();
-                if (waSession) waClientId = waSession.clientId;
-            }
-        }
+        // Warm up Baileys session for this user
+        getClient(clientId).catch(() => {});
 
-        // Only warm up WhatsApp for the ws_ client (not usr_'s separate WhatsApp instance)
-        // This prevents usr_ from trying to auth its own WhatsApp and generating stale QR codes
-        if (waClientId !== clientId || clientId.startsWith('ws_')) {
-            getClient(waClientId).catch(() => {});
-        }
-
-        const waSession = await Session.findOne({ clientId: waClientId });
+        const waSession = await Session.findOne({ clientId });
         // Only emit stored QR if auth files exist on disk — stale DB QR causes immediate close
-        const hasAuthFiles = fs.existsSync(path.join(process.cwd(), 'sessions', waClientId));
-        console.log(`[JOIN] clientId=${clientId} waClientId=${waClientId} waSession.status=${waSession?.status} waSession.qr=${waSession?.qr ? 'HAS_QR' : 'null'} hasAuth=${hasAuthFiles} waSession.wid=${waSession?.whatsappWid}`);
+        const hasAuthFiles = fs.existsSync(path.join(process.cwd(), 'sessions', clientId));
+        console.log(`[JOIN] clientId=${clientId} waSession.status=${waSession?.status} waSession.qr=${waSession?.qr ? 'HAS_QR' : 'null'} hasAuth=${hasAuthFiles}`);
         if (waSession?.qr && hasAuthFiles) {
             socket.emit('qr', waSession.qr);
         } else if (waSession?.qr && !hasAuthFiles) {
             // QR in DB but no auth files — clear it, don't emit stale QR
-            await Session.updateOne({ clientId: waClientId }, { $set: { qr: null, status: 'DISCONNECTED' } });
+            await Session.updateOne({ clientId }, { $set: { qr: null, status: 'DISCONNECTED' } });
             socket.emit('status', 'DISCONNECTED');
         } else if (waSession?.status === 'READY') {
             socket.emit('ready', 'Connected');
