@@ -125,13 +125,13 @@ jobs:
 
             # Stop and remove old container (keep volumes)
             echo "Stopping old container..."
-            docker stop concertos-whatsapp 2>/dev/null || true
-            docker rm concertos-whatsapp 2>/dev/null || true
+            docker stop concertos-whatsapp-new 2>/dev/null || true
+            docker rm concertos-whatsapp-new 2>/dev/null || true
 
             # Run new container with zero-downtime
             echo "Starting new container..."
             docker run -d \
-              --name concertos-whatsapp \
+              --name concertos-whatsapp-new \
               --restart always \
               --env-file .env.prod \
               -p 80:3000 \
@@ -142,14 +142,14 @@ jobs:
             # Wait for health check
             echo "Waiting for container to be healthy..."
             for i in $(seq 1 30); do
-              if docker exec concertos-whatsapp wget -qO- http://localhost:3000/health > /dev/null 2>&1; then
+              if docker exec concertos-whatsapp-new wget -qO- http://localhost:3000/health > /dev/null 2>&1; then
                 echo "✅ Container is healthy after ${i} attempts"
                 break
               fi
               if [ $i -eq 30 ]; then
                 echo "❌ Health check failed after 30 attempts — rolling back"
-                docker stop concertos-whatsapp
-                docker rm concertos-whatsapp
+                docker stop concertos-whatsapp-new
+                docker rm concertos-whatsapp-new
                 exit 1
               fi
               sleep 2
@@ -157,13 +157,13 @@ jobs:
 
             echo ""
             echo "=== Docker Status ==="
-            docker ps --filter "name=concertos-whatsapp"
+            docker ps --filter "name=concertos-whatsapp-new"
             echo ""
             echo "=== Health Check ==="
             curl -s http://localhost/health || echo "Health check via curl failed"
             echo ""
             echo "=== Recent Logs ==="
-            docker logs --tail 20 concertos-whatsapp
+            docker logs --tail 20 concertos-whatsapp-new
             echo ""
             echo "=== Memory ==="
             free -m
