@@ -2,7 +2,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { makeWASocket, useMultiFileAuthState, Browsers, delay, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,13 +106,11 @@ class WhatsAppManager {
         }
 
         const sock = makeWASocket({
-            version: [2, 3000, 1015901307],
             auth: {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'warn' })),
             },
-            browser: Browsers.macOS('Desktop'),
-            logger: pino({ level: 'trace' }),
+            logger: pino({ level: 'warn' }),
             printQRInTerminal: false,
             defaultQueryTimeoutMs: 60_000,
             // Disable heavy features to save RAM
@@ -126,6 +124,16 @@ class WhatsAppManager {
         console.log(`[Baileys] [SOCK=${sock._clientSeq}] Created socket for ${clientId}, clients.size=${clients.size}`);
 
         sock.ev.on('creds.update', saveCreds);
+
+        // ── Patch end() so genPairQR() can emit QR before listeners are removed ──
+        // Baileys' internal end() removes all ev listeners BEFORE genPairQR's setTimeout(0)
+        // QR can fire. Fix: defer removeAllListeners by one tick so queued events fire first.
+        // We patch sock.ev.removeAllListeners — in Baileys v6 this IS the internal ev.
+        const origRemoveAllListeners = sock.ev.removeAllListeners.bind(sock.ev);
+        sock.ev.removeAllListeners = function(...args) {
+            // Defer removal so any queued connection.update { qr } events reach our handler first
+            setTimeout(() => { origRemoveAllListeners(...args); }, 0);
+        };
 
         // ── Phase 3: Wire incoming messages to Swarm/blackboard ──────────────
         sock.ev.on('messages.upsert', async ({ messages }) => {
@@ -244,7 +252,7 @@ class WhatsAppManager {
                 // - Account has too many linked devices (>5)
                 // - Device was previously linked then unlinked (stale session)
                 // - Rate limit hit on the link endpoint
-                const is405 = errMsg.includes('405') || errMsg.includes('link rejected') ||
+                const is405 = errTag === 405 || errMsg.includes('link rejected') ||
                     errMsg.toLowerCase().includes('too many devices') ||
                     errMsg.toLowerCase().includes('unpaired');
                 const isStale = errMsg.toLowerCase().includes('stale') || errMsg.toLowerCase().includes('pairing');
@@ -256,24 +264,15 @@ class WhatsAppManager {
                     console.warn(`[Baileys] Link failure #${count} for ${clientId}: ${errMsg}`);
 
                     if (count === 1) {
-                        // First failure — emit guidance, don't delete session yet
+                        // First failure — emit guidance, no auto-retry
                         this._emit(clientId, 'link_error', {
                             code: is405 ? 'TOO_MANY_DEVICES' : 'STALE_SESSION',
                             message: is405
                                 ? 'WhatsApp rejected the link — too many devices may be linked to your account. Unlink unused devices from your phone and try again.'
                                 : 'Your WhatsApp session is stale. Unlink unused devices from your phone and try again.',
-                            retryIn: 30, // seconds until auto-retry
+                            retryIn: null,
                             hint: 'On WhatsApp: Settings → Linked Devices → Unlink devices you don\'t use',
                         });
-                        // Auto-retry after 30s (only once)
-                        setTimeout(() => {
-                            const current = linkFailures.get(clientId);
-                            if (current === 1) {
-                                linkFailures.delete(clientId);
-                                console.log(`[Baileys] Auto-retrying link for ${clientId}`);
-                                this.initializeSession(clientId).catch(() => {});
-                            }
-                        }, 30_000);
                     } else {
                         // Multiple failures — stop retrying, require manual action
                         linkFailures.delete(clientId);
@@ -775,6 +774,12 @@ class WhatsAppManager {
                 const existingAttempts = this.reconnectAttempts.get(clientId) || 0;
                 if (existingAttempts > 0) {
                     console.warn(`[HealthCheck] Reconnect already in progress for ${clientId}, skipping duplicate`);
+                    return;
+                }
+
+                // Don't auto-reconnect if there are active link failures (405) — let user fix first
+                if (linkFailures.has(clientId)) {
+                    console.warn(`[HealthCheck] ${clientId} has active link failures — skipping auto-reconnect`);
                     return;
                 }
 
