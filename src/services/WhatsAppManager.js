@@ -91,7 +91,19 @@ class WhatsAppManager {
         const clientDir = path.join(SESSION_DIR, clientId);
         if (!fs.existsSync(clientDir)) fs.mkdirSync(clientDir, { recursive: true });
 
-        const { state, saveCreds } = await useMultiFileAuthState(clientDir);
+        let { state, saveCreds } = await useMultiFileAuthState(clientDir);
+
+        // If creds.json doesn't exist or has no valid identity, clear stale session dir.
+        // This handles Puppeteer-era auth files that Baileys can't use.
+        const credsPath = path.join(clientDir, 'creds.json');
+        if (!fs.existsSync(credsPath)) {
+            console.log(`[Baileys] No valid Baileys creds found for ${clientId} — clearing stale session dir`);
+            try { fs.rmSync(clientDir, { recursive: true, force: true }); } catch (e) {}
+            fs.mkdirSync(clientDir, { recursive: true });
+            const fresh = await useMultiFileAuthState(clientDir);
+            state = fresh.state;
+            saveCreds = fresh.saveCreds;
+        }
 
         const sock = makeWASocket({
             version: [2, 3000, 1015901307],

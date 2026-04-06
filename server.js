@@ -2833,18 +2833,21 @@ io.on('connection', (socket) => {
         getClient(clientId).catch(() => {});
 
         const waSession = await Session.findOne({ clientId });
-        // Only emit stored QR if auth files exist on disk — stale DB QR causes immediate close
         const hasAuthFiles = fs.existsSync(path.join(process.cwd(), 'sessions', clientId));
-        console.log(`[JOIN] clientId=${clientId} waSession.status=${waSession?.status} waSession.qr=${waSession?.qr ? 'HAS_QR' : 'null'} hasAuth=${hasAuthFiles}`);
-        if (waSession?.qr && hasAuthFiles) {
-            socket.emit('qr', waSession.qr);
-        } else if (waSession?.qr && !hasAuthFiles) {
-            // QR in DB but no auth files — clear it, don't emit stale QR
-            await Session.updateOne({ clientId }, { $set: { qr: null, status: 'DISCONNECTED' } });
+        // Check if auth files contain valid Baileys credentials (creds.json exists = authenticated)
+        const hasValidBaileysAuth = hasAuthFiles && fs.existsSync(path.join(process.cwd(), 'sessions', clientId, 'creds.json'));
+        console.log(`[JOIN] clientId=${clientId} waSession.status=${waSession?.status} waSession.qr=${waSession?.qr ? 'HAS_QR' : 'null'} hasAuth=${hasAuthFiles} hasValidBaileysAuth=${hasValidBaileysAuth}`);
+
+        // If user is fully authenticated with Baileys, emit ready
+        if (hasValidBaileysAuth && waSession?.status === 'READY') {
+            socket.emit('ready', 'Connected');
+        } else if (hasAuthFiles && !hasValidBaileysAuth) {
+            // Auth directory exists but no valid creds — needs fresh QR from Baileys
             socket.emit('status', 'DISCONNECTED');
         } else if (waSession?.status === 'READY') {
             socket.emit('ready', 'Connected');
         } else {
+            // No auth files, no QR stored — Baileys will emit fresh QR via initializeSession
             socket.emit('status', waSession?.status || 'DISCONNECTED');
         }
     });
