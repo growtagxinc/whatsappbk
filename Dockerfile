@@ -1,6 +1,6 @@
 FROM node:20-bookworm-slim
 
-# Install system dependencies for Puppeteer
+# Install system dependencies for Puppeteer + git for npm
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -15,6 +15,11 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     && rm -rf /var/lib/apt/lists/*
+
+# Configure git to use HTTPS instead of SSH for GitHub
+# (needed for libsignal and eslint-config which use git+ssh:// URLs)
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:" && \
+    git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 
 WORKDIR /app
 COPY package*.json ./
