@@ -1,0 +1,47 @@
+# Render Blueprint — Concertos WhatsApp Engine
+# Deploy: renderctl deploy --spec render.yaml
+# Or connect GitHub repo manually at render.com
+
+services:
+  - type: web
+    name: concertos-whatsapp
+    env: node
+    region: singapore
+    plan: free
+    nodeVersion: "20"
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      # ── AI PROVIDERS ──────────────────────────────────────
+      - key: GROQ_API_KEY
+        sync: false   # Set via render.com dashboard (hide from blueprint)
+      - key: OPENROUTER_API_KEY
+        sync: false
+      # ── INFRASTRUCTURE ──────────────────────────────────
+      # Set MONGODB_URI and REDIS_URL via render.com dashboard
+      - key: MONGODB_URI
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      # ── GOOGLE OAUTH ────────────────────────────────────
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        value: https://dash.concertos.brandproinc.in/settings
+      # ── AUTH ────────────────────────────────────────────
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ALLOW_UNAUTHENTICATED
+        value: false
+      # ── RATE LIMITING ──────────────────────────────────
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+      - key: RATE_LIMIT_MAX_MESSAGES
+        value: "30"

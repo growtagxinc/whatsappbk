@@ -1,0 +1,26 @@
+const mongoose = require('mongoose');
+
+/**
+ * Chat — WhatsApp conversation metadata
+ * Persisted in MongoDB so chat history survives WhatsApp Web restarts.
+ * Updated on every inbound/outbound message.
+ */
+const ChatSchema = new mongoose.Schema({
+    clientId:   { type: String, required: true, index: true },
+    chatId:    { type: String, required: true, unique: true }, // `${clientId}:${wid}`
+    wid:       { type: String, required: true, index: true },   // WhatsApp contact ID
+    name:      { type: String, default: '' },
+    type:      { type: String, default: 'chat' }, // 'chat' | 'group'
+    unread:    { type: Number, default: 0 },
+    lastMessage:     { type: String, default: '' },
+    lastMessageId:   { type: String, default: '' },
+    lastMessageFromMe: { type: Boolean, default: false },
+    lastInteraction: { type: Number, default: 0 }, // unix timestamp (seconds)
+    lastOpened:     { type: Number, default: 0 }, // unix timestamp — updated when user opens the chat
+    isActive:  { type: Boolean, default: true },
+    pinned:    { type: Boolean, default: false },
+}, { timestamps: true });
+
+ChatSchema.index({ clientId: 1, pinned: -1, lastOpened: -1, lastInteraction: -1 });
+
+module.exports = mongoose.model('Chat', ChatSchema);

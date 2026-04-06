@@ -1,0 +1,12 @@
+node_modules
+.wwebjs_auth*
+.puppeteer_user_data
+.wwebjs_cache
+npm-debug.log
+error.log
+.env
+Dockerfile
+docker-compose.yml
+.git
+.github
+*.md
