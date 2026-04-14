@@ -2,8 +2,11 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const CircuitBreaker = require('opossum');
+const Bottleneck = require('bottleneck');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WhatsAppManager — Baileys-based WhatsApp integration for ConcertOS
@@ -21,6 +24,8 @@ const pendingMessages = new Map(); // clientId -> Array of { jid, text, timestam
 const lastActivity = new Map();    // clientId -> timestamp
 const messageQueue = [];           // BullMQ queue fallback (Redis-backed in production)
 const linkFailures = new Map();    // clientId -> consecutive failure count (for 405 backoff)
+const reconnectTimers = new Map(); // clientId -> TimeoutId for pending reconnect (prevents race conditions)
+const pendingInits = new Map();   // clientId -> Promise of in-flight initializeSession (prevents concurrent inits)
 
 // Config constants
 const SESSION_DIR = path.join(process.cwd(), 'sessions');
@@ -43,12 +48,85 @@ class WhatsAppManager {
         this._onConnectedFired = new Map(); // Track per-client whether _onConnected has run for current socket
         this._healthCheckStopped = new Map(); // Track whether health check was stopped by close event
 
+        // ── Circuit Breakers & Rate Limiters ────────────────────────────
+        // Per-client rate limiters (prevents WhatsApp ban from burst sends)
+        this.clientLimiters = new Map();
+
+        // Global circuit breakers for WhatsApp operations
+        this._circuitBreakers = new Map();
+
         // Ensure session directory exists
         if (!fs.existsSync(SESSION_DIR)) {
             fs.mkdirSync(SESSION_DIR, { recursive: true });
         }
 
         this._startPruner();
+    }
+
+    // ── Circuit Breaker Factory ────────────────────────────────────────
+    // Returns or creates a circuit breaker for a given operation name.
+    // Opens circuit on >50% failures in 10s window → 30s cooldown before half-open.
+    _getBreaker(operationName, options = {}) {
+        if (!this._circuitBreakers.has(operationName)) {
+            const breaker = new CircuitBreaker(
+                async (...args) => {
+                    // Wrapper: extract the actual function and args
+                    const [fn, ...fnArgs] = args;
+                    return fn(...fnArgs);
+                },
+                {
+                    timeout: options.timeout || 10000,      // Consider failed if >10s
+                    errorThresholdPercentage: 50,           // Open if >50% failures
+                    resetTimeout: 30000,                    // Try again after 30s
+                    ...options,
+                }
+            );
+
+            // Log circuit state changes
+            breaker.on('open', () => {
+                console.warn(`[CIRCUIT] ${operationName} OPEN — WhatsApp operations failing`);
+            });
+            breaker.on('close', () => {
+                console.log(`[CIRCUIT] ${operationName} CLOSED — WhatsApp operations restored`);
+            });
+            breaker.on('halfOpen', () => {
+                console.log(`[CIRCUIT] ${operationName} HALF-OPEN — testing recovery`);
+            });
+
+            this._circuitBreakers.set(operationName, breaker);
+        }
+        return this._circuitBreakers.get(operationName);
+    }
+
+    // ── Per-Client Rate Limiter Factory ────────────────────────────────
+    // Returns or creates a Bottleneck rate limiter for a client.
+    // Enforces max 50 msgs/hour via minTime spacing (3600s / 50 = 72s between sends).
+    _getClientLimiter(clientId) {
+        if (!this.clientLimiters.has(clientId)) {
+            const limiter = new Bottleneck({
+                maxConcurrent: 1,          // One send at a time
+                minTime: 72000,            // 72s between sends = 50/hour max
+            });
+            this.clientLimiters.set(clientId, limiter);
+        }
+        return this.clientLimiters.get(clientId);
+    }
+
+    // ── Circuit-Protected Message Send ────────────────────────────────
+    // Wraps _sendRaw in a circuit breaker — on open, queues message instead of failing.
+    async _sendWithCircuit(clientId, jid, text, opts = {}) {
+        const breaker = this._getBreaker('whatsapp:send');
+
+        const sendFn = () => this._sendRaw(clientId, jid, text, opts);
+
+        try {
+            return await breaker.fire(sendFn);
+        } catch (err) {
+            // Circuit is open or operation failed — queue message for retry
+            console.warn(`[CIRCUIT] Send blocked for ${clientId}, queueing: ${err.message}`);
+            await this._queueMessage(clientId, jid, text, opts);
+            return { queued: true, reason: 'circuit_open' };
+        }
     }
 
     setGroqClient(client) {
@@ -63,10 +141,30 @@ class WhatsAppManager {
      * @param {string} clientId
      * @returns {Promise<object>} Baileys socket
      */
-    async initializeSession(clientId) {
+    // ── Deduplication wrapper: prevents cascade of concurrent initializeSession calls ──
+    // Two callers can fire simultaneously:
+    //   A. Scheduled reconnect timer (5s after close)
+    //   B. Dashboard poll / health check (every 5s / 30s)
+    // Both call this wrapper. The wrapper ensures only ONE actual init runs at a time.
+    async initializeSession(clientId, phone) {
         if (!clientId) throw new Error('clientId required');
 
-        // Return existing authenticated socket
+        // Cancel any pending reconnect timer — we're creating a fresh socket now.
+        if (reconnectTimers.has(clientId)) {
+            clearTimeout(reconnectTimers.get(clientId));
+            reconnectTimers.delete(clientId);
+            console.log(`[Baileys] Cancelled pending reconnect for ${clientId}`);
+        }
+
+        // De-duplicate: if an init is already in flight for this client, wait for it.
+        // This prevents the cascade where a scheduled reconnect fires while a
+        // dashboard-initiated init is also running.
+        if (pendingInits.has(clientId)) {
+            console.log(`[Baileys] Init already in flight for ${clientId}, waiting...`);
+            return pendingInits.get(clientId);
+        }
+
+        // Return existing authenticated socket if alive
         if (clients.has(clientId)) {
             const sock = clients.get(clientId);
             if (sock.ws && sock.ws.readyState === 1) {
@@ -75,6 +173,32 @@ class WhatsAppManager {
             }
             console.log(`[Baileys] Stale socket found for ${clientId} (readyState=${sock.ws?.readyState}), reinitializing`);
         }
+
+        // Derive a stable session key from phone — survives auth method changes.
+        const phoneHash = phone
+            ? crypto.createHash('sha256').update(phone).digest('hex').substring(0, 16)
+            : null;
+        const sessionKey = phoneHash || clientId;
+
+        // Mark init as in-flight; _doInitializeSession calls this method so we need
+        // the wrapper to set the promise BEFORE calling the body.
+        const initPromise = this._doInitializeSession(clientId, phoneHash, sessionKey).finally(() => {
+            pendingInits.delete(clientId);
+        });
+        pendingInits.set(clientId, initPromise);
+        return initPromise;
+    }
+
+    // ── Actual session initialization (called only by the initializeSession wrapper above) ──
+    async _doInitializeSession(clientId, phoneHash, sessionKey) {
+        // Wipe stale session files on every fresh init attempt — this fixes the case where
+        // WhatsApp rejected the link (405 "too many devices") and Baileys can't resume.
+        const clientDir = path.join(SESSION_DIR, sessionKey);
+        if (fs.existsSync(clientDir)) {
+            try { fs.rmSync(clientDir, { recursive: true, force: true }); } catch (e) {}
+            console.log(`[Baileys] Cleared stale session files for ${clientId}`);
+        }
+        if (!fs.existsSync(clientDir)) fs.mkdirSync(clientDir, { recursive: true });
 
         const seq = (this._initSeq = (this._initSeq || 0) + 1);
         console.log(`[Baileys] [SEQ=${seq}] INITIALIZING session for: ${clientId} (clients.size=${clients.size})`);
@@ -88,16 +212,12 @@ class WhatsAppManager {
         this._onConnectedFired.set(clientId, false);
         this.reconnectAttempts.set(clientId, 0);
 
-        const clientDir = path.join(SESSION_DIR, clientId);
-        if (!fs.existsSync(clientDir)) fs.mkdirSync(clientDir, { recursive: true });
-
         let { state, saveCreds } = await useMultiFileAuthState(clientDir);
 
         // If creds.json doesn't exist or has no valid identity, clear stale session dir.
         // This handles Puppeteer-era auth files that Baileys can't use.
         const credsPath = path.join(clientDir, 'creds.json');
         if (!fs.existsSync(credsPath)) {
-            console.log(`[Baileys] No valid Baileys creds found for ${clientId} — clearing stale session dir`);
             try { fs.rmSync(clientDir, { recursive: true, force: true }); } catch (e) {}
             fs.mkdirSync(clientDir, { recursive: true });
             const fresh = await useMultiFileAuthState(clientDir);
@@ -214,6 +334,12 @@ class WhatsAppManager {
                     console.log(`[Baileys] [SEQ=${sockSeq}] OPEN skipped — _onConnected already ran for this client`);
                     return; // Guard: skip if _onConnected already ran
                 }
+                // Cancel any pending reconnect timers — we're connected successfully.
+                if (reconnectTimers.has(clientId)) {
+                    clearTimeout(reconnectTimers.get(clientId));
+                    reconnectTimers.delete(clientId);
+                    console.log(`[Baileys] Cancelled pending reconnect on successful connect for ${clientId}`);
+                }
                 this._onConnectedFired.set(clientId, true);
                 console.log(`[Baileys] [SEQ=${sockSeq}] Connected for ${clientId}, running _onConnected...`);
                 this._updateStatus(clientId, 'READY', { authenticated: true, qr: null });
@@ -308,11 +434,13 @@ class WhatsAppManager {
                     if (attempts <= 3) { // Limit to 3 retries
                         const delay = Math.min(5000 * Math.pow(2, attempts - 1), 30000); // Max 30s delay
                         console.log(`[Baileys] Scheduling reconnect for ${clientId} in ${delay}ms (attempt ${attempts})`);
-                        setTimeout(() => {
-                            this.initializeSession(clientId).catch(err => {
+                        const timerId = setTimeout(async () => {
+                            reconnectTimers.delete(clientId);
+                            this.initializeSession(clientId, phone).catch(err => {
                                 console.error(`[Baileys] Reconnect failed for ${clientId}:`, err.message);
                             });
                         }, delay);
+                        reconnectTimers.set(clientId, timerId);
                     } else {
                         console.error(`[Baileys] Max reconnect attempts reached for ${clientId}`);
                         this.reconnectAttempts.delete(clientId);
@@ -474,11 +602,9 @@ class WhatsAppManager {
         const randomDelay = 2000 + Math.floor(Math.random() * 3000);
         await delay(charDelay + randomDelay);
 
-        // Step 3: Rate limiting — max 50 outbound/hour per client
-        if (!this._checkRateLimit(clientId)) {
-            console.warn(`[AntiBan] Rate limit hit for ${clientId}, queueing message.`);
-            return this._queueMessage(clientId, jid, text, opts);
-        }
+        // Step 3: Bottleneck rate limiting — per-client, max 50/hour
+        const limiter = this._getClientLimiter(clientId);
+        await limiter.schedule(() => {}); // Throttle to minTime spacing
 
         // Step 4: AI Message Variability — rephrase to prevent signature-based banning
         let finalText = text;
@@ -486,28 +612,41 @@ class WhatsAppManager {
             finalText = await this._variateMessage(text).catch(() => text);
         }
 
-        return this._sendRaw(clientId, jid, finalText, opts);
+        // Step 5: Circuit-protected send — on failure/circuit-open, queue for retry
+        return this._sendWithCircuit(clientId, jid, finalText, opts);
     }
 
     /**
      * AI-powered message rephrasing for anti-ban signature detection.
      * Subtle variations — keep meaning, change structure/wording.
      */
+    // ── Circuit-Protected Message Variability ───────────────────────
     async _variateMessage(text) {
         if (!this.groqClient || !text) return text;
+
+        const breaker = this._getBreaker('whatsapp:variate', {
+            timeout: 8000,
+            errorThresholdPercentage: 75,
+            resetTimeout: 15000,
+        });
+
         try {
-            const response = await this.groqClient.chat.completions.create({
-                model: 'llama-3.3-70b-versatile',
-                messages: [{
-                    role: 'user',
-                    content: `Rephrase this WhatsApp business message with subtle wording changes. Keep the same meaning and tone. Do not add emojis or change the core message:\n\n"${text}"`
-                }],
-                max_tokens: 200,
-                temperature: 0.7,
+            const result = await breaker.fire(async () => {
+                const response = await this.groqClient.chat.completions.create({
+                    model: 'llama-3.3-70b-versatile',
+                    messages: [{
+                        role: 'user',
+                        content: `Rephrase this WhatsApp business message with subtle wording changes. Keep the same meaning and tone. Do not add emojis or change the core message:\n\n"${text}"`
+                    }],
+                    max_tokens: 200,
+                    temperature: 0.7,
+                });
+                return response.choices[0]?.message?.content?.trim() || text;
             });
-            return response.choices[0]?.message?.content?.trim() || text;
-        } catch (e) {
-            return text;
+            return result;
+        } catch (err) {
+            console.warn(`[CIRCUIT] Message variate failed for ${clientId}: ${err.message}`);
+            return text; // Fallback: use original text
         }
     }
 
@@ -637,19 +776,19 @@ class WhatsAppManager {
      * 2. Incoming message event detected → this is a no-op (Baileys keeps socket alive)
      * 3. Periodic polling (fallback for webhook-like behavior)
      */
-    async wakeClient(clientId) {
+    async wakeClient(clientId, phone) {
         if (clients.has(clientId)) {
             const sock = clients.get(clientId);
             if (sock.ws && sock.ws.readyState === 1) return sock; // Already awake
         }
-        return this.initializeSession(clientId);
+        return this.initializeSession(clientId, phone);
     }
 
     /**
      * Prune a client's socket (close WebSocket, optionally remove auth).
      * Auth files on disk remain — allows re-auth without QR re-scan.
      */
-    async _pruneClient(clientId, keepAuth = true) {
+    async _pruneClient(clientId, sessionDirKey, keepAuth = true) {
         if (idleTimers.has(clientId)) {
             clearTimeout(idleTimers.get(clientId));
             idleTimers.delete(clientId);
@@ -674,7 +813,8 @@ class WhatsAppManager {
 
         // keepAuth=true: leave session directory intact for auto-wake
         if (!keepAuth) {
-            const clientDir = path.join(SESSION_DIR, clientId);
+            const dirKey = sessionDirKey || clientId;
+            const clientDir = path.join(SESSION_DIR, dirKey);
             if (fs.existsSync(clientDir)) {
                 fs.rmSync(clientDir, { recursive: true, force: true });
             }
@@ -798,9 +938,18 @@ class WhatsAppManager {
     }
 
     _emit(clientId, event, data) {
-        if (this.io) {
-            this.io.to(clientId).emit(event, data);
+        if (!this.io) {
+            console.warn(`[Baileys] _emit skipped: this.io is null (clientId=${clientId}, event=${event})`);
+            return;
         }
+        const room = this.io.sockets.adapter.rooms.get(clientId);
+        const roomSize = room ? room.size : 0;
+        if (roomSize === 0) {
+            console.warn(`[Baileys] _emit: NO SOCKETS in room '${clientId}' for event '${event}' — frontend not joined?`);
+        } else {
+            console.log(`[Baileys] _emit: room=${clientId} event=${event} sockets_in_room=${roomSize}`);
+        }
+        this.io.to(clientId).emit(event, data);
     }
 
     async _updateStatus(clientId, status, extra = {}) {
@@ -820,8 +969,10 @@ class WhatsAppManager {
     /**
      * Disconnect and clean up a client entirely (logout + delete auth files).
      */
-    async destroySession(clientId) {
-        await this._pruneClient(clientId, false);
+    async destroySession(clientId, sessionDirKey) {
+        // sessionDirKey = phone hash when phone is available; falls back to clientId for backward compat
+        const dirKey = sessionDirKey || clientId;
+        await this._pruneClient(clientId, dirKey, false);
         pendingMessages.delete(clientId);
         lastActivity.delete(clientId);
         linkFailures.delete(clientId);
@@ -874,15 +1025,27 @@ class WhatsAppManager {
         for (const [clientId] of clients) {
             this._pruneClient(clientId, keepAuth = true).catch(() => {});
         }
-        
+
         // Clear all health check intervals
         for (const [clientId, interval] of this.healthChecks) {
             clearInterval(interval);
         }
         this.healthChecks.clear();
-        
+
         // Clear reconnect attempts tracking
         this.reconnectAttempts.clear();
+
+        // Close all circuit breakers
+        for (const [name, breaker] of this._circuitBreakers) {
+            breaker.shutdown();
+        }
+        this._circuitBreakers.clear();
+
+        // Close all client rate limiters
+        for (const [clientId, limiter] of this.clientLimiters) {
+            limiter.disconnect();
+        }
+        this.clientLimiters.clear();
     }
 }
 
