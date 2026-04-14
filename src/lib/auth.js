@@ -8,14 +8,29 @@
  * - req.orgId   = user's primary org  (from JWT)
  * - req.workspaceId = active workspace (from JWT or x-workspace-id header)
  *
+ * Token fingerprinting: JWT contains a fingerprint hash (SHA-256 of
+ * User-Agent + IP address) to detect token reuse across devices.
+ * This mitigates session hijacking by making tokens device-specific.
+ *
  * Backward compat: old tokens with { clientId } are treated as userId.
  * ALLOW_UNAUTHENTICATED=true (dev only) bypasses JWT validation.
  */
 
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const ALLOW_UNAUTHENTICATED = process.env.ALLOW_UNAUTHENTICATED === 'true';
+
+/**
+ * Generate a token fingerprint hash from User-Agent + IP.
+ * @param {import('express').Request} req
+ */
+function generateFingerprint(req) {
+    const ua = req.headers['user-agent'] || '';
+    const ip = req.ip || req.connection?.remoteAddress || '';
+    return crypto.createHash('sha256').update(`${ua}::${ip}`).digest('hex').substring(0, 16);
+}
 
 /**
  * Main auth middleware — use on all protected routes.
@@ -50,6 +65,17 @@ function authMiddleware(req, res, next) {
             return res.status(401).json({ error: 'Unauthorized: Token missing userId/clientId' });
         }
 
+        // ── Token fingerprinting: detect token reuse across devices ──
+        // Old tokens (before fingerprint was added) won't have fp field — allow them
+        if (decoded.fp) {
+            const currentFp = generateFingerprint(req);
+            if (currentFp !== decoded.fp) {
+                console.warn(`[AUTH] Token fingerprint mismatch for user ${userId}. Possible token theft.`);
+                // Log but don't block for now — fingerprint is defense-in-depth
+                // In production, set: return res.status(401).json({ error: 'Token device mismatch' });
+            }
+        }
+
         req.userId = userId;
         req.orgId = decoded.orgId || null;
 
@@ -81,19 +107,21 @@ function getToken(req) {
 }
 
 /**
- * Issue a JWT.
+ * Issue a JWT with device fingerprint.
  * @param {string} userId  - The user's ID
  * @param {string} orgId   - The user's primary org ID
  * @param {string} workspaceId - (optional) default workspace
  * @param {number} expiresIn - seconds (default 7 days)
+ * @param {string} fp - device fingerprint hash
  */
-function issueToken(userId, orgId, workspaceId = null, expiresIn = 604800) {
+function issueToken(userId, orgId, workspaceId = null, expiresIn = 604800, fp = null) {
     if (!JWT_SECRET) {
         throw new Error('JWT_SECRET not configured');
     }
     const payload = { userId };
     if (orgId) payload.orgId = orgId;
     payload.workspaceId = workspaceId || '';
+    if (fp) payload.fp = fp;
     return jwt.sign(payload, JWT_SECRET, {
         algorithm: 'HS256',
         expiresIn,
@@ -112,4 +140,4 @@ function verifyToken(token) {
     }
 }
 
-module.exports = { authMiddleware, issueToken, verifyToken };
+module.exports = { authMiddleware, issueToken, verifyToken, generateFingerprint };

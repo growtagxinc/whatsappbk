@@ -1,8 +1,29 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
+const { z } = require('zod');
 const Ticket = require('../../models/Ticket');
 const { authMiddleware } = require('../lib/auth');
+const { validate } = require('../lib/validate-middleware');
+
+// ── Zod Schemas for Ticket routes ─────────────────────────────────────────
+const CreateTicketSchema = z.object({
+    title: z.string().min(1, 'Title is required').max(200),
+    description: z.string().optional(),
+    chatId: z.string().max(100).optional(),
+    customerName: z.string().max(200).optional(),
+    priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
+    tags: z.array(z.string()).optional(),
+});
+
+const UpdateTicketSchema = z.object({
+    title: z.string().min(1).max(200).optional(),
+    description: z.string().optional(),
+    status: z.enum(['open', 'in_progress', 'resolved']).optional(),
+    priority: z.enum(['low', 'medium', 'high', 'urgent']).optional(),
+    assignedTo: z.string().max(100).optional(),
+    tags: z.array(z.string()).optional(),
+});
 
 // All ticket routes require authentication
 router.use(authMiddleware);
@@ -43,13 +64,12 @@ router.get('/', async (req, res) => {
  * Create a new ticket.
  * Body: { title, description?, chatId?, customerName?, priority?, tags? }
  */
-router.post('/', async (req, res) => {
+router.post('/', validate(CreateTicketSchema), async (req, res) => {
     try {
         const { workspaceId, userId } = req;
         if (!workspaceId) return res.status(401).json({ error: 'No workspace' });
 
-        const { title, description, chatId, customerName, priority, tags } = req.body;
-        if (!title?.trim()) return res.status(400).json({ error: 'Title is required' });
+        const { title, description, chatId, customerName, priority, tags } = req.validatedBody;
 
         const ticketId = `TKT-${crypto.randomInt(10000, 99999)}`;
 
@@ -108,14 +128,19 @@ router.get('/:ticketId', async (req, res) => {
  * PATCH /api/tickets/:ticketId
  * Update ticket fields: status, priority, assignedTo, assigneeName, title, tags.
  */
-router.patch('/:ticketId', async (req, res) => {
+router.patch('/:ticketId', validate(UpdateTicketSchema), async (req, res) => {
     try {
         const { workspaceId, userId } = req;
-        const allowed = ['status', 'priority', 'assignedTo', 'assigneeName', 'title', 'description', 'tags'];
+        const { title, description, status, priority, assignedTo, tags } = req.validatedBody;
+
+        // Build update object from validated fields
         const updates = {};
-        for (const key of allowed) {
-            if (req.body[key] !== undefined) updates[key] = req.body[key];
-        }
+        if (title !== undefined) updates.title = title;
+        if (description !== undefined) updates.description = description;
+        if (status !== undefined) updates.status = status;
+        if (priority !== undefined) updates.priority = priority;
+        if (assignedTo !== undefined) updates.assignedTo = assignedTo;
+        if (tags !== undefined) updates.tags = tags;
 
         const ticket = await Ticket.findOneAndUpdate(
             { ticketId: req.params.ticketId, clientId: workspaceId },

@@ -3,6 +3,18 @@ const Signal = require('../models/Signal');
 const AgentState = require('../models/AgentState');
 const { getAgentExecutor } = require('./AgentExecutor');
 
+// Redlock for distributed locking (prevents race conditions in signal claiming)
+let Redlock = null;
+try {
+    Redlock = require('redlock');
+} catch (e) {
+    // redlock not available — will use MongoDB atomic operations as fallback
+}
+
+const LOCK_TTL_MS = 5000;  // 5s lock — signals should be claimed quickly
+const LOCK_RETRY_COUNT = 2;
+const LOCK_RETRY_DELAY = 200; // ms
+
 /**
  * SwarmManager — The Blackboard Orchestrator
  * 
@@ -52,14 +64,76 @@ class SwarmManager {
     }
 
     /**
-     * Claim a Signal — atomic operation to prevent race conditions.
-     * Uses findOneAndUpdate with status check for safe concurrency.
+     * Claim a Signal — distributed lock + atomic update to prevent race conditions.
+     * When Redis is available: uses Redlock for distributed locking.
+     * Fallback: MongoDB findOneAndUpdate atomic operation.
      */
-    async claimSignal(signalId, agentId) {
+    async claimSignal(signalId, agentId, redisClient = null) {
+        let claimedSignal = null;
+
+        // ── Redlock path: distributed lock via Redis ──────────────
+        if (Redlock && redisClient) {
+            try {
+                const redlock = new Redlock([redisClient], {
+                    driftFactor: 0.01,
+                    retryCount: LOCK_RETRY_COUNT,
+                    retryDelay: LOCK_RETRY_DELAY,
+                });
+
+                claimedSignal = await redlock.using([`signal:${signalId}:claim`], LOCK_TTL_MS, async () => {
+                    // Double-check within lock — another process may have claimed
+                    const existing = await Signal.findOne({ _id: signalId, status: 'CLAIMED' });
+                    if (existing) {
+                        throw new Error('Signal already claimed');
+                    }
+
+                    const signal = await Signal.findOneAndUpdate(
+                        { _id: signalId, status: 'PENDING' },
+                        {
+                            status: 'CLAIMED',
+                            assignedAgent: agentId,
+                            assignedAt: new Date()
+                        },
+                        { new: true }
+                    );
+
+                    return signal;
+                });
+
+                if (!claimedSignal) {
+                    console.log(`⚠️ [SWARM] Signal ${signalId} already claimed or not found (Redlock path)`);
+                    return null;
+                }
+
+                // Update agent workload (outside lock — no contention risk)
+                await this._updateAgentWorkload(agentId, claimedSignal);
+                console.log(`🤖 [SWARM] Agent ${agentId} claimed signal ${signalId} (${claimedSignal.type}) via Redlock`);
+
+                // Fire & Forget execution
+                const executor = getAgentExecutor(this);
+                setImmediate(() => {
+                    executor.executeSignal(claimedSignal._id, agentId).catch(err => {
+                        console.error(`[EXECUTOR ERROR] ${claimedSignal._id}:`, err.message);
+                    });
+                });
+
+                return claimedSignal;
+            } catch (err) {
+                if (err.message?.includes('already claimed') || err.message?.includes('locked')) {
+                    console.log(`⚠️ [SWARM] Signal ${signalId} already claimed (Redlock path)`);
+                    return null;
+                }
+                // Redlock failed — fall through to MongoDB atomic path
+                console.warn(`[SWARM] Redlock failed for ${signalId}, falling back to MongoDB: ${err.message}`);
+            }
+        }
+
+        // ── MongoDB atomic fallback: safe without Redis ───────────
+        // findOneAndUpdate with status filter is atomic — prevents double-claim
         const signal = await Signal.findOneAndUpdate(
             { _id: signalId, status: 'PENDING' },
-            { 
-                status: 'CLAIMED', 
+            {
+                status: 'CLAIMED',
                 assignedAgent: agentId,
                 assignedAt: new Date()
             },
@@ -71,16 +145,8 @@ class SwarmManager {
             return null;
         }
 
-        // Add to agent's active workload
-        await AgentState.findOneAndUpdate(
-            { agentId },
-            { 
-                $addToSet: { activeSignals: signal._id },
-                $set: { status: 'ACTIVE', lastHeartbeat: new Date() }
-            }
-        );
-
-        console.log(`🤖 [SWARM] Agent ${agentId} claimed signal ${signalId} (${signal.type})`);
+        await this._updateAgentWorkload(agentId, signal);
+        console.log(`🤖 [SWARM] Agent ${agentId} claimed signal ${signalId} (${signal.type}) via MongoDB atomic`);
 
         if (this.io) {
             this.io.to(signal.clientId).emit('signal:claimed', {
@@ -103,8 +169,62 @@ class SwarmManager {
 
     /**
      * Resolve a Signal — mark as complete with audit trail.
+     * Uses Redlock if Redis available to prevent concurrent resolve operations.
      */
-    async resolveSignal(signalId, result, reasoning_path, confidence_score) {
+    async resolveSignal(signalId, result, reasoning_path, confidence_score, redisClient = null) {
+        const lockKey = `signal:${signalId}:resolve`;
+
+        // ── Redlock path: prevent concurrent resolve ──────────────
+        if (Redlock && redisClient) {
+            try {
+                const redlock = new Redlock([redisClient], {
+                    driftFactor: 0.01,
+                    retryCount: LOCK_RETRY_COUNT,
+                    retryDelay: LOCK_RETRY_DELAY,
+                });
+
+                const signal = await redlock.using([lockKey], LOCK_TTL_MS, async () => {
+                    return Signal.findOneAndUpdate(
+                        { _id: signalId, status: 'CLAIMED' },
+                        {
+                            status: 'RESOLVED',
+                            result,
+                            reasoning_path,
+                            confidence_score,
+                            resolvedAt: new Date()
+                        },
+                        { new: true }
+                    );
+                });
+
+                if (!signal) {
+                    console.log(`⚠️ [SWARM] Signal ${signalId} not in CLAIMED state, cannot resolve`);
+                    return null;
+                }
+
+                await this._updateAgentAfterResolve(signal.assignedAgent, signal._id, confidence_score);
+                console.log(`✅ [SWARM] Signal ${signalId} resolved by ${signal.assignedAgent} (confidence: ${confidence_score}) via Redlock`);
+
+                if (this.io) {
+                    this.io.to(signal.clientId).emit('signal:resolved', {
+                        id: signal._id,
+                        agentId: signal.assignedAgent,
+                        confidence_score
+                    });
+                }
+
+                return signal;
+            } catch (err) {
+                if (err.message?.includes('locked')) {
+                    console.warn(`[SWARM] Signal ${signalId} resolve already in progress`);
+                    return null;
+                }
+                console.warn(`[SWARM] Redlock resolve failed for ${signalId}, falling back: ${err.message}`);
+                // Fall through to MongoDB path
+            }
+        }
+
+        // ── MongoDB atomic fallback ─────────────────────────────────
         const signal = await Signal.findOneAndUpdate(
             { _id: signalId, status: 'CLAIMED' },
             {
@@ -122,28 +242,8 @@ class SwarmManager {
             return null;
         }
 
-        // Update agent metrics
-        await AgentState.findOneAndUpdate(
-            { agentId: signal.assignedAgent },
-            {
-                $pull: { activeSignals: signal._id },
-                $inc: { totalSignalsProcessed: 1 },
-                $set: { status: 'IDLE' }
-            }
-        );
-
-        // Update running average confidence
-        const agent = await AgentState.findOne({ agentId: signal.assignedAgent });
-        if (agent && confidence_score !== undefined) {
-            const total = agent.totalSignalsProcessed;
-            const newAvg = ((agent.avgConfidenceScore * (total - 1)) + confidence_score) / total;
-            await AgentState.findOneAndUpdate(
-                { agentId: signal.assignedAgent },
-                { $set: { avgConfidenceScore: Math.round(newAvg * 1000) / 1000 } }
-            );
-        }
-
-        console.log(`✅ [SWARM] Signal ${signalId} resolved by ${signal.assignedAgent} (confidence: ${confidence_score})`);
+        await _updateAgentAfterResolve(signal.assignedAgent, signal._id, confidence_score);
+        console.log(`✅ [SWARM] Signal ${signalId} resolved by ${signal.assignedAgent} (confidence: ${confidence_score}) via MongoDB atomic`);
 
         if (this.io) {
             this.io.to(signal.clientId).emit('signal:resolved', {
@@ -410,6 +510,65 @@ class SwarmManager {
             'HEARTBEAT': 9
         };
         return priorities[type] || 5;
+    }
+
+    // ── Private helpers ──────────────────────────────────────
+
+    /**
+     * Update agent's active workload after claiming a signal.
+     * Extracted to a helper so Redlock path can reuse it.
+     */
+    async _updateAgentWorkload(agentId, signal) {
+        await AgentState.findOneAndUpdate(
+            { agentId },
+            {
+                $addToSet: { activeSignals: signal._id },
+                $set: { status: 'ACTIVE', lastHeartbeat: new Date() }
+            }
+        );
+
+        if (this.io) {
+            this.io.to(signal.clientId).emit('signal:claimed', {
+                id: signal._id,
+                agentId,
+                type: signal.type
+            });
+        }
+
+        // Fire & Forget execution
+        const executor = getAgentExecutor(this);
+        setImmediate(() => {
+            executor.executeSignal(signal._id, agentId).catch(err => {
+                console.error(`[EXECUTOR ERROR] ${signal._id}:`, err.message);
+            });
+        });
+    }
+
+    /**
+     * Update agent metrics after resolving a signal.
+     * Extracted to a helper so Redlock path can reuse it.
+     */
+    async _updateAgentAfterResolve(agentId, signalId, confidence_score) {
+        // Update agent: remove from active, increment count, set idle
+        await AgentState.findOneAndUpdate(
+            { agentId },
+            {
+                $pull: { activeSignals: signalId },
+                $inc: { totalSignalsProcessed: 1 },
+                $set: { status: 'IDLE' }
+            }
+        );
+
+        // Update running average confidence
+        const agent = await AgentState.findOne({ agentId });
+        if (agent && confidence_score !== undefined) {
+            const total = agent.totalSignalsProcessed;
+            const newAvg = ((agent.avgConfidenceScore * (total - 1)) + confidence_score) / total;
+            await AgentState.findOneAndUpdate(
+                { agentId },
+                { $set: { avgConfidenceScore: Math.round(newAvg * 1000) / 1000 } }
+            );
+        }
     }
 }
 

@@ -1,10 +1,19 @@
 const Groq = require("groq-sdk");
+const { z } = require("zod");
 const { handleFaq, handleSales, handleCustom, getConfig } = require("./agents");
 const { handleVision } = require("./vision");
 const { safeJsonParse } = require("./utils");
 const { sanitizeAIInput } = require("./sanitize");
+const { createStructuredCompletion } = require("../src/lib/instructor-groq");
 
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
+
+// Zod schema for intent detection response
+const IntentResponseSchema = z.object({
+    intent: z.enum(["FAQ", "SALES", "CUSTOM", "HANDOFF_HUMAN"]),
+    profileUrl: z.union([z.string().url(), z.null()]).optional(),
+    reasoning: z.string().optional(),
+});
 
 async function determineIntent(textMsg) {
     if (!process.env.GROQ_API_KEY) return { intent: 'FAQ', profileUrl: null };
@@ -14,28 +23,27 @@ async function determineIntent(textMsg) {
     if (!sanitized.text) return { intent: 'FAQ', profileUrl: null };
 
     try {
-        const completion = await groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            response_format: { type: "json_object" },
-            temperature: 0.1,
+        const result = await createStructuredCompletion({
             messages: [
-                {
-                    role: "system",
-                    content: "Determine the intent of the user message. Categories: FAQ (questions about product/collab), SALES (agreeing to collab, sharing details), CUSTOM (specific requests/complaints), HANDOFF_HUMAN (angry/complex). \n\nIMPORTANT: If the message contains a social media profile link (Instagram, TikTok, YouTube, etc.), extract it and return it in the JSON.\n\nOutput JSON ONLY: {\"intent\": \"...\", \"profileUrl\": \"https://...\"}"
-                },
                 {
                     role: "user",
                     content: sanitized.text
                 }
             ],
+            schema: IntentResponseSchema,
+            schemaName: "IntentDetection",
+            systemPrompt: "Determine the intent of the user message. Categories: FAQ (questions about product/collab), SALES (agreeing to collab, sharing details), CUSTOM (specific requests/complaints), HANDOFF_HUMAN (angry/complex). IMPORTANT: If the message contains a social media profile link (Instagram, TikTok, YouTube, etc.), extract it and return it in the JSON. Output JSON: {\"intent\": \"...\", \"profileUrl\": \"https://...\"}",
+            maxRetries: 3,
         });
 
-        let text = completion.choices[0].message.content;
-        const parsed = safeJsonParse(text);
+        if (result.fallback || !result.success) {
+            console.warn("[AI-ROUTER] Intent detection failed, falling back to FAQ");
+            return { intent: 'FAQ', profileUrl: null };
+        }
 
         return {
-            intent: parsed.intent || 'FAQ',
-            profileUrl: parsed.profileUrl || null
+            intent: result.data.intent,
+            profileUrl: result.data.profileUrl || null
         };
     } catch (err) {
         console.error("Intent Determination Error:", err.message);

@@ -25,6 +25,8 @@ const makeNoiseHandler = ({ keyPair: { private: privateKey, public: publicKey },
         return result;
     };
     const decrypt = (ciphertext) => {
+        // before the handshake is finished, we use the same counter
+        // after handshake, the counters are different
         const iv = generateIV(isFinished ? readCounter : writeCounter);
         const result = (0, crypto_1.aesDecryptGCM)(ciphertext, decKey, iv, hash);
         if (isFinished) {
@@ -76,41 +78,9 @@ const makeNoiseHandler = ({ keyPair: { private: privateKey, public: publicKey },
         mixIntoKey,
         finishInit,
         processHandshake: async ({ serverHello }, noiseKey) => {
-            // WhatsApp sends raw base64 strings — convert to Buffer for crypto operations
-            // Defensively handle ALL possible shapes including null/undefined/empty
-            let ephemeralRaw = Buffer.alloc(32);
-            if (Buffer.isBuffer(serverHello?.ephemeral)) {
-                ephemeralRaw = serverHello.ephemeral;
-            } else if (Buffer.isBuffer(serverHello?.ephemeral?.publicKey)) {
-                ephemeralRaw = serverHello.ephemeral.publicKey;
-            } else if (typeof serverHello?.ephemeral === 'string') {
-                ephemeralRaw = Buffer.from(serverHello.ephemeral, 'base64');
-            } else if (serverHello?.ephemeral && typeof serverHello.ephemeral === 'object') {
-                const keys = Object.keys(serverHello.ephemeral);
-                if (keys.length > 0 && serverHello.ephemeral[keys[0]]) {
-                    ephemeralRaw = Buffer.isBuffer(serverHello.ephemeral[keys[0]])
-                        ? serverHello.ephemeral[keys[0]]
-                        : Buffer.from(serverHello.ephemeral[keys[0]], 'base64');
-                }
-            }
-            let staticRaw = Buffer.alloc(32);
-            if (Buffer.isBuffer(serverHello?.static)) {
-                staticRaw = serverHello.static;
-            } else if (Buffer.isBuffer(serverHello?.static?.publicKey)) {
-                staticRaw = serverHello.static.publicKey;
-            } else if (typeof serverHello?.static === 'string') {
-                staticRaw = Buffer.from(serverHello.static, 'base64');
-            } else if (serverHello?.static && typeof serverHello.static === 'object') {
-                const skeys = Object.keys(serverHello.static);
-                if (skeys.length > 0 && serverHello.static[skeys[0]]) {
-                    staticRaw = Buffer.isBuffer(serverHello.static[skeys[0]])
-                        ? serverHello.static[skeys[0]]
-                        : Buffer.from(serverHello.static[skeys[0]], 'base64');
-                }
-            }
-            authenticate(ephemeralRaw);
-            await mixIntoKey(crypto_1.Curve.sharedKey(privateKey, ephemeralRaw));
-            const decStaticContent = decrypt(staticRaw);
+            authenticate(serverHello.ephemeral);
+            await mixIntoKey(crypto_1.Curve.sharedKey(privateKey, serverHello.ephemeral));
+            const decStaticContent = decrypt(serverHello.static);
             await mixIntoKey(crypto_1.Curve.sharedKey(privateKey, decStaticContent));
             const certDecoded = decrypt(serverHello.payload);
             const { intermediate: certIntermediate } = WAProto_1.proto.CertChain.decode(certDecoded);
@@ -119,7 +89,7 @@ const makeNoiseHandler = ({ keyPair: { private: privateKey, public: publicKey },
                 throw new boom_1.Boom('certification match failed', { statusCode: 400 });
             }
             const keyEnc = encrypt(noiseKey.public);
-            await mixIntoKey(crypto_1.Curve.sharedKey(noiseKey.private, ephemeralRaw));
+            await mixIntoKey(crypto_1.Curve.sharedKey(noiseKey.private, serverHello.ephemeral));
             return keyEnc;
         },
         encodeFrame: (data) => {
@@ -152,6 +122,9 @@ const makeNoiseHandler = ({ keyPair: { private: privateKey, public: publicKey },
         },
         decodeFrame: async (newData, onFrame) => {
             var _a;
+            // the binary protocol uses its own framing mechanism
+            // on top of the WS frames
+            // so we get this data and separate out the frames
             const getBytesSize = () => {
                 if (inBytes.length >= 3) {
                     return (inBytes.readUInt8() << 16) | inBytes.readUInt16BE(1);

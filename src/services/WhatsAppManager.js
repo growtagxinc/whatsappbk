@@ -436,7 +436,7 @@ class WhatsAppManager {
                         console.log(`[Baileys] Scheduling reconnect for ${clientId} in ${delay}ms (attempt ${attempts})`);
                         const timerId = setTimeout(async () => {
                             reconnectTimers.delete(clientId);
-                            this.initializeSession(clientId, phone).catch(err => {
+                            this.wakeClient(clientId).catch(err => {
                                 console.error(`[Baileys] Reconnect failed for ${clientId}:`, err.message);
                             });
                         }, delay);
@@ -764,7 +764,7 @@ class WhatsAppManager {
         if (idleTimers.has(clientId)) clearTimeout(idleTimers.get(clientId));
         const timer = setTimeout(async () => {
             console.log(`[Baileys] Auto-pruning idle client: ${clientId}`);
-            await this._pruneClient(clientId, keepAuth = true);
+            await this._pruneClient(clientId, true);
         }, IDLE_TIMEOUT_MS);
         idleTimers.set(clientId, timer);
         lastActivity.set(clientId, Date.now());
@@ -876,7 +876,7 @@ class WhatsAppManager {
             for (const [clientId, last] of lastActivity) {
                 if (now - last > IDLE_TIMEOUT_MS) {
                     console.log(`[Pruner] Force-pruning inactive client: ${clientId}`);
-                    await this._pruneClient(clientId, keepAuth = true);
+                    await this._pruneClient(clientId, true);
                 }
             }
         }, PRUNE_INTERVAL_MS);
@@ -1023,7 +1023,7 @@ class WhatsAppManager {
     shutdown() {
         if (this.pruneTimer) clearInterval(this.pruneTimer);
         for (const [clientId] of clients) {
-            this._pruneClient(clientId, keepAuth = true).catch(() => {});
+            this._pruneClient(clientId, true).catch(() => {});
         }
 
         // Clear all health check intervals

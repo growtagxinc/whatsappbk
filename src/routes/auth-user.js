@@ -2,17 +2,43 @@ require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env'
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const { z } = require('zod');
+const { zxcvbn } = require('zxcvbn');
 const User = require('../../models/User');
 const Organisation = require('../../models/Organisation');
 const OrgMember = require('../../models/OrgMember');
 const Workspace = require('../../models/Workspace');
 const Session = require('../../models/Session');
 const AIConfig = require('../../models/AIConfig');
-const { issueToken, verifyToken } = require('../lib/auth');
+const { issueToken, verifyToken, generateFingerprint } = require('../lib/auth');
+const { validate } = require('../lib/validate-middleware');
 
 const router = express.Router();
 const JWT_COOKIE_NAME = 'concertos_token';
 const SALT_ROUNDS = 12;
+
+// ─── Zod Schemas for Auth ──────────────────────────────────────
+
+const RegisterSchema = z.object({
+    email: z.string().email('Invalid email address'),
+    password: z
+        .string()
+        .min(8, 'Password must be at least 8 characters')
+        .max(128, 'Password too long'),
+    displayName: z.string().min(1, 'Display name is required').max(100),
+    phone: z.string().regex(/^\+91[6-9]\d{9}$/, 'Phone must be +91 followed by 10 digits').optional(),
+    orgName: z.string().min(2, 'Organisation name too short').max(100),
+});
+
+const LoginSchema = z.object({
+    email: z.string().email('Invalid email address'),
+    password: z.string().min(1, 'Password is required'),
+});
+
+const UpdateProfileSchema = z.object({
+    displayName: z.string().min(1).max(100).optional(),
+    phone: z.string().regex(/^\+91[6-9]\d{9}$/).optional(),
+});
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -210,26 +236,26 @@ async function buildMeResponse(userId, orgId, workspaceId) {
 }
 
 // ─── POST /api/auth/register ───────────────────────────────────
-router.post('/register', async (req, res) => {
+router.post('/register', validate(RegisterSchema), async (req, res) => {
     try {
-        const { email, password, orgName, workspaceName, phone, displayName } = req.body;
-
-        if (!email || !password || !orgName) {
-            return res.status(400).json({ error: 'Email, password, and organisation name are required' });
-        }
-        if (password.length < 8) {
-            return res.status(400).json({ error: 'Password must be at least 8 characters' });
-        }
-
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(email)) {
-            return res.status(400).json({ error: 'Invalid email format' });
-        }
+        const { email, password, orgName, workspaceName, phone, displayName } = req.validatedBody;
 
         const normalizedEmail = email.toLowerCase().trim();
+
+        // Check if account already exists
         const existingUser = await User.findOne({ email: normalizedEmail, isActive: true });
         if (existingUser) {
             return res.status(409).json({ error: 'An account with this email already exists' });
+        }
+
+        // Check password strength with zxcvbn
+        const strength = zxcvbn(password);
+        if (strength.score < 3) {
+            return res.status(400).json({
+                error: 'Password too weak',
+                feedback: strength.feedback.suggestions,
+                strength: strength.score,
+            });
         }
 
         // Generate IDs
@@ -256,6 +282,8 @@ router.post('/register', async (req, res) => {
         try { await member.save(); } catch(e) { e.step = 'OrgMember'; throw e; }
 
         // ── Create User ────────────────────────────────────
+        // Store phoneHash so WhatsApp sessions can be found by phone number across auth methods.
+        const phoneHash = phone ? crypto.createHash('sha256').update(phone.replace(/\D/g, '')).digest('hex').substring(0, 16) : null;
         const user = new User({
             clientId: userId,
             email: normalizedEmail,
@@ -264,6 +292,7 @@ router.post('/register', async (req, res) => {
             displayName: displayName || orgName.trim(),
             authMethods: ['password'],
             primaryOrgId: orgId,
+            phoneHash: phoneHash || undefined,
         });
         try { await user.save(); } catch(e) { e.step = 'User'; throw e; }
 
@@ -275,7 +304,8 @@ router.post('/register', async (req, res) => {
         });
         try { await ws.save(); } catch(e) { e.step = 'Workspace'; throw e; }
 
-        // ── Create Session (legacy WhatsApp state container) ─
+        // Link WhatsApp session by phone when creating Session record.
+        // The sessionKey used on disk = SHA-256(phone).substring(0,16) (same as WhatsAppManager).
         const session = new Session({
             clientId: userId,
             orgId,
@@ -285,6 +315,7 @@ router.post('/register', async (req, res) => {
             businessName: (workspaceName || orgName).trim(),
             workspaceName: (workspaceName || orgName).trim(),
             phone: phone || '',
+            phoneHash: phoneHash || undefined,
             company: orgName.trim(),
             onboardingStep: 1,
         });
@@ -299,8 +330,9 @@ router.post('/register', async (req, res) => {
         });
         try { await aiConfig.save(); } catch(e) { e.step = 'AIConfig'; throw e; }
 
-        // ── Issue JWT ─────────────────────────────────────
-        const token = issueToken(userId, orgId, workspaceId);
+        // ── Issue JWT with device fingerprint ─────────────────
+        const fp = generateFingerprint(req);
+        const token = issueToken(userId, orgId, workspaceId, 604800, fp);
         setTokenCookie(res, token);
 
         res.status(201).json({
@@ -355,12 +387,9 @@ router.post('/register', async (req, res) => {
 });
 
 // ─── POST /api/auth/login ─────────────────────────────────────
-router.post('/login', async (req, res) => {
+router.post('/login', validate(LoginSchema), async (req, res) => {
     try {
-        const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ error: 'Email and password are required' });
-        }
+        const { email, password } = req.validatedBody;
 
         const normalizedEmail = email.toLowerCase().trim();
         const user = await User.findOne({ email: normalizedEmail, isActive: true });
@@ -387,15 +416,21 @@ router.post('/login', async (req, res) => {
             workspaceId = ws?.workspaceId || null;
         }
 
-        const token = issueToken(user.clientId, orgId, workspaceId);
+        const fp = generateFingerprint(req);
+        const token = issueToken(user.clientId, orgId, workspaceId, 604800, fp);
         setTokenCookie(res, token);
 
         // Sync canonical fields + workspaceId/orgId into Session (upsert in case session was wiped)
+        // Also store phoneHash so WhatsApp sessions can be found by phone across auth methods.
+        const userPhoneHash = user.phone
+            ? crypto.createHash('sha256').update(user.phone.replace(/\D/g, '')).digest('hex').substring(0, 16)
+            : null;
         await Session.findOneAndUpdate(
             { clientId: user.clientId },
             {
                 $set: {
                     phone: user.phone || '',
+                    phoneHash: userPhoneHash || undefined,
                     email: user.email || '',
                     displayName: user.displayName || '',
                     workspaceId: workspaceId,
@@ -440,8 +475,9 @@ router.get('/me', requireAuth, async (req, res) => {
         if (!data) {
             return res.status(404).json({ error: 'User not found' });
         }
-        // Issue a fresh token so frontend can store in localStorage for Bearer auth
-        const token = issueToken(req.userId, req.orgId, req.workspaceId);
+        // Issue a fresh token with current device fingerprint
+        const fp = generateFingerprint(req);
+        const token = issueToken(req.userId, req.orgId, req.workspaceId, 604800, fp);
         res.json({ ...data, token });
     } catch (err) {
         console.error('Get user error:', err);
@@ -619,7 +655,8 @@ router.get('/google/callback', async (req, res) => {
                 businessName: wsName,
             }).save();
 
-            const token = issueToken(userId, orgId, workspaceId);
+            const fp = generateFingerprint(req);
+            const token = issueToken(userId, orgId, workspaceId, 604800, fp);
             setTokenCookie(res, token);
 
             // Also set a JS-readable cookie (not httpOnly) so the frontend can store
@@ -657,7 +694,8 @@ router.get('/google/callback', async (req, res) => {
                 workspaceId = ws?.workspaceId || null;
             }
 
-            const token = issueToken(user.clientId, orgId, workspaceId);
+            const fp = generateFingerprint(req);
+            const token = issueToken(user.clientId, orgId, workspaceId, 604800, fp);
             console.log('[GoogleOAuth] Login token issued for:', user.email, '| token:', token.substring(0, 30) + '...');
             setTokenCookie(res, token);
 
@@ -700,9 +738,9 @@ router.get('/google/callback', async (req, res) => {
 });
 
 // ─── PUT /api/auth/profile ────────────────────────────────────────
-router.put('/profile', requireAuth, async (req, res) => {
+router.put('/profile', requireAuth, validate(UpdateProfileSchema), async (req, res) => {
     try {
-        const { displayName, email, phone, company } = req.body;
+        const { displayName, phone, email } = req.validatedBody;
         const updates = {};
         if (displayName !== undefined) updates.displayName = displayName;
         if (phone !== undefined) updates.phone = phone;

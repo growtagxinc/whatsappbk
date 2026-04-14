@@ -1,6 +1,8 @@
 const Groq = require("groq-sdk");
+const { z } = require("zod");
 const { safeJsonParse } = require("./utils");
 const { sanitizeMessage } = require("./sanitize");
+const { createStructuredCompletion } = require("../src/lib/instructor-groq");
 
 const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 
@@ -46,6 +48,20 @@ Use audit data to personalize. Be warm and professional.`,
     }
 };
 
+// Zod schemas for AI agent responses
+const FaqResponseSchema = z.object({
+    response: z.string(),
+});
+
+const SalesResponseSchema = z.object({
+    response: z.string(),
+    qualification: z.enum(["HOT", "WARM", "COLD"]).optional(),
+});
+
+const CustomResponseSchema = z.object({
+    response: z.string(),
+});
+
 async function handleFaq(userMessage, auditData = null) {
     if (!process.env.GROQ_API_KEY) return { response: "API Key Missing", intent: 'FAQ' };
     if (!aiConfig.faq.isActive) return { response: null, intent: 'FAQ' };
@@ -55,18 +71,25 @@ async function handleFaq(userMessage, auditData = null) {
 
     let auditContext = auditData ? `\n\nCREATOR CONTEXT: Niche: ${auditData.bio}, Followers: ${auditData.followersText}.` : "";
     try {
-        const completion = await groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            response_format: { type: "json_object" },
+        const result = await createStructuredCompletion({
+            messages: [{ role: "user", content: sanitized.clean }],
+            schema: FaqResponseSchema,
+            schemaName: "FaqResponse",
+            systemPrompt: aiConfig.faq.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\"}",
             temperature: 0.4,
-            messages: [
-                { role: "system", content: aiConfig.faq.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\"}" },
-                { role: "user", content: sanitized.clean }
-            ],
+            maxRetries: 3,
         });
-        const parsed = safeJsonParse(completion.choices[0].message.content);
-        return { response: parsed.response || "No response", intent: 'FAQ' };
-    } catch (err) { return { response: "Technical hiccup! 😅", intent: 'FAQ' }; }
+
+        if (result.success && result.data) {
+            return { response: result.data.response, intent: 'FAQ' };
+        }
+        // Fallback on parse failure
+        console.warn("[AGENTS] FAQ response parsing failed, using fallback");
+        return { response: "Sorry, I had trouble understanding. Could you rephrase?", intent: 'FAQ' };
+    } catch (err) {
+        console.error("[AGENTS] FAQ error:", err.message);
+        return { response: "Technical hiccup! 😅", intent: 'FAQ' };
+    }
 }
 
 async function handleSales(userMessage, auditData = null) {
@@ -78,17 +101,28 @@ async function handleSales(userMessage, auditData = null) {
 
     let auditContext = auditData ? `\n\nCREATOR CONTEXT: Niche: ${auditData.bio}, Followers: ${auditData.followersText}.` : "";
     try {
-        const completion = await groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            response_format: { type: "json_object" },
+        const result = await createStructuredCompletion({
+            messages: [{ role: "user", content: sanitized.clean }],
+            schema: SalesResponseSchema,
+            schemaName: "SalesResponse",
+            systemPrompt: aiConfig.sales.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\", \"qualification\": \"HOT/WARM/COLD\"}",
             temperature: 0.4,
-            messages: [
-                { role: "system", content: aiConfig.sales.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\", \"qualification\": \"HOT/WARM/COLD\"}" },
-                { role: "user", content: sanitized.clean }
-            ],
+            maxRetries: 3,
         });
-        return safeJsonParse(completion.choices[0].message.content);
-    } catch (err) { return { response: "Let's collab! 🚀", intent: 'SALES', qualification: 'WARM' }; }
+
+        if (result.success && result.data) {
+            return {
+                response: result.data.response,
+                qualification: result.data.qualification || 'WARM',
+                intent: 'SALES'
+            };
+        }
+        console.warn("[AGENTS] Sales response parsing failed, using fallback");
+        return { response: "Let's collab! 🚀", intent: 'SALES', qualification: 'WARM' };
+    } catch (err) {
+        console.error("[AGENTS] Sales error:", err.message);
+        return { response: "Let's collab! 🚀", intent: 'SALES', qualification: 'WARM' };
+    }
 }
 
 async function handleCustom(userMessage, auditData = null) {
@@ -100,17 +134,24 @@ async function handleCustom(userMessage, auditData = null) {
 
     let auditContext = auditData ? `\n\nCREATOR CONTEXT: Niche: ${auditData.bio}, Followers: ${auditData.followersText}.` : "";
     try {
-        const completion = await groq.chat.completions.create({
-            model: "llama-3.3-70b-versatile",
-            response_format: { type: "json_object" },
+        const result = await createStructuredCompletion({
+            messages: [{ role: "user", content: sanitized.clean }],
+            schema: CustomResponseSchema,
+            schemaName: "CustomResponse",
+            systemPrompt: aiConfig.custom.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\"}",
             temperature: 0.7,
-            messages: [
-                { role: "system", content: aiConfig.custom.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\"}" },
-                { role: "user", content: sanitized.clean }
-            ],
+            maxRetries: 3,
         });
-        return safeJsonParse(completion.choices[0].message.content);
-    } catch (err) { return { response: "Got it! ✨", intent: 'CUSTOM' }; }
+
+        if (result.success && result.data) {
+            return { response: result.data.response, intent: 'CUSTOM' };
+        }
+        console.warn("[AGENTS] Custom response parsing failed, using fallback");
+        return { response: "Got it! ✨", intent: 'CUSTOM' };
+    } catch (err) {
+        console.error("[AGENTS] Custom error:", err.message);
+        return { response: "Got it! ✨", intent: 'CUSTOM' };
+    }
 }
 
 function updateConfig(type, updates) {

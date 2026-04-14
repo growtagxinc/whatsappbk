@@ -1,5 +1,12 @@
+const { z } = require("zod");
 const { getConfig } = require("./agents");
 const { safeJsonParse } = require("./utils");
+
+// Zod schema for vision analysis response
+const VisionResponseSchema = z.object({
+    response: z.string(),
+    profileUrl: z.union([z.string().url(), z.null()]).optional(),
+});
 
 // Accepts a single image string OR an array of image strings
 async function handleVision(imageInput, textPrompt = "Analyze all the images sent in this conversation.", auditData = null) {
@@ -74,9 +81,17 @@ Note: If this verified data contradicts the screenshots, PRIORITIZE this verifie
 
         let text = completion.choices[0].message.content;
         const parsed = safeJsonParse(text);
+
+        // Validate LLM output against Zod schema
+        const validated = VisionResponseSchema.safeParse(parsed);
+        if (!validated.success) {
+            console.warn("[VISION] AI output validation failed:", validated.error.message);
+            return { response: "Sorry, I couldn't process the images properly.", profileUrl: null };
+        }
+
         return {
-            response: parsed.response || "No response generated.",
-            profileUrl: parsed.profileUrl || null
+            response: validated.data.response || "No response generated.",
+            profileUrl: validated.data.profileUrl || null
         };
     } catch (err) {
         console.error("Vision AI Error:", err);

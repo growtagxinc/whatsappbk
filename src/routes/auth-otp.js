@@ -2,15 +2,31 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const { z } = require('zod');
 const OTP = require('../../models/OTP');
 const Session = require('../../models/Session');
-const { issueToken } = require('../lib/auth');
+const { issueToken, generateFingerprint } = require('../lib/auth');
+const { validate } = require('../lib/validate-middleware');
 
 const OTP_LENGTH = 6;
 const OTP_TTL_SECONDS = 300; // 5 minutes (matches MongoDB TTL index)
-const MAX_ATTEMPTS = 5;
+const MAX_ATTEMPTS = 3;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 per minute per email+clientId
+const MAX_OTP_REQUESTS_PER_HOUR = 5; // Max 5 OTP emails per hour per email
+const otpRequestsMap = new Map(); // {email: {count, resetAt}}
 const rateLimitMap = new Map(); // {email+clientId: {count, resetAt}}
+
+// ─── Zod Schemas for OTP ──────────────────────────────────────
+const SendOTPSchema = z.object({
+    email: z.string().email('Invalid email address'),
+    clientId: z.string().max(100).optional(),
+});
+
+const VerifyOTPSchema = z.object({
+    email: z.string().email('Invalid email address'),
+    code: z.string().min(1, 'Code is required').max(10),
+    clientId: z.string().max(100).optional(),
+});
 
 // ── Nodemailer transporter ────────────────────────────────────
 function createTransporter() {
@@ -52,28 +68,41 @@ function checkRateLimit(email, clientId) {
     return true;
 }
 
+// ── Hourly OTP request limit ─────────────────────────────────
+function checkHourlyLimit(email) {
+    const now = Date.now();
+    const hourMs = 60 * 60 * 1000;
+    const entry = otpRequestsMap.get(email);
+
+    if (!entry || now > entry.resetAt) {
+        otpRequestsMap.set(email, { count: 1, resetAt: now + hourMs });
+        return true;
+    }
+
+    if (entry.count >= MAX_OTP_REQUESTS_PER_HOUR) return false;
+    entry.count++;
+    return true;
+}
+
 /**
  * POST /api/auth/send-otp
  * Generate and send an OTP to the given email address.
  * Associates the OTP with clientId for session linking.
- *
- * Body: { email: string, clientId?: string }
  */
-router.post('/send-otp', async (req, res) => {
-    const { email, clientId = 'default' } = req.body;
-
-    if (!email || typeof email !== 'string') {
-        return res.status(400).json({ error: 'email is required' });
-    }
+router.post('/send-otp', validate(SendOTPSchema), async (req, res) => {
+    const { email, clientId = 'default' } = req.validatedBody;
 
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Basic email format validation
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
-        return res.status(400).json({ error: 'Invalid email format' });
+    // Hourly rate limit: max 5 OTP emails per hour per email
+    if (!checkHourlyLimit(normalizedEmail)) {
+        return res.status(429).json({
+            error: 'Too many OTP requests. Please wait an hour before requesting again.',
+            retryAfterSeconds: 3600
+        });
     }
 
-    // Rate limit: 1 OTP per minute per email+clientId
+    // Per-minute rate limit: 1 OTP per minute per email+clientId
     if (!checkRateLimit(normalizedEmail, clientId)) {
         return res.status(429).json({
             error: 'Too many requests. Please wait before requesting another OTP.',
@@ -131,15 +160,9 @@ router.post('/send-otp', async (req, res) => {
 /**
  * POST /api/auth/verify-otp
  * Verify the OTP code and issue a JWT session token.
- *
- * Body: { email: string, code: string, clientId?: string }
  */
-router.post('/verify-otp', async (req, res) => {
-    const { email, code, clientId = 'default' } = req.body;
-
-    if (!email || !code) {
-        return res.status(400).json({ error: 'email and code are required' });
-    }
+router.post('/verify-otp', validate(VerifyOTPSchema), async (req, res) => {
+    const { email, code, clientId = 'default' } = req.validatedBody;
 
     const normalizedEmail = email.toLowerCase().trim();
     const trimmedCode = (code || '').trim();
@@ -187,8 +210,9 @@ router.post('/verify-otp', async (req, res) => {
             { upsert: true, new: true }
         );
 
-        // Issue JWT token for this clientId
-        const token = issueToken(clientId);
+        // Issue JWT token with device fingerprint for this clientId
+        const fp = generateFingerprint(req);
+        const token = issueToken(clientId, null, null, 604800, fp);
 
         console.log(`[OTP] Verified ${normalizedEmail} for clientId=${clientId}`);
         res.json({
