@@ -156,27 +156,7 @@ app.get('/api/profiles', (req, res, next) => {
         if (mongoose.connection.readyState !== 1) {
             return res.json({ session: { status: 'DISCONNECTED', authenticated: false, qr: null } });
         }
-
-        // Primary lookup by userId
-        let session = await Session.findOne({ clientId: userId });
-
-        // CRITICAL FALLBACK: if userId session not found, try phone/email lookup.
-        // This handles the Google OAuth new userId → orphaned session problem.
-        if (!session && req.headers['x-phone']) {
-            const phone = req.headers['x-phone'].replace(/\D/g, '');
-            const sessionKey = getSessionKey(phone, null);
-            const sessionDir = path.join(process.cwd(), 'sessions', sessionKey);
-            const hasDiskSession = fs.existsSync(sessionDir);
-            if (hasDiskSession) {
-                console.log(`[Profiles] userId session not found but disk session exists at ${sessionKey} for phone ${phone}`);
-                // Look for any session with this phone
-                const phoneSession = await Session.findOne({ phone: phone }).select('clientId').lean();
-                if (phoneSession) {
-                    session = await Session.findOne({ clientId: phoneSession.clientId });
-                }
-            }
-        }
-
+        const session = await Session.findOne({ clientId: userId });
         if (!session) return res.json({ session: { status: 'DISCONNECTED', authenticated: false, qr: null } });
 
         // Baileys live status as primary, DB flag as fallback
@@ -199,7 +179,7 @@ app.post('/api/profiles/init', authMiddleware, async (req, res) => {
             }
         }
 
-        const clientId = req.userId || req.headers['x-client-id'] || 'default';
+        const clientId = req.workspaceId || req.userId || req.headers["x-workspace-id"] || "default";
 
         // Guard: if already has a QR in DB AND auth files exist on disk, reuse it.
         // If the auth files were wiped (e.g. server restart), the stale QR will be
@@ -223,53 +203,6 @@ app.post('/api/profiles/init', authMiddleware, async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Pull-based QR: request QR after joining socket room ────────────────────
-app.post('/qr/request', authMiddleware, async (req, res) => {
-    try {
-        if (req.orgId) {
-            const member = await OrgMember.findOne({ userId: req.userId, orgId: req.orgId });
-            if (!member || member.role !== 'owner') {
-                return res.status(403).json({ error: 'Only workspace owner can link WhatsApp' });
-            }
-        }
-
-        const clientId = req.userId || req.headers['x-client-id'] || 'default';
-        const existing = await Session.findOne({ clientId });
-
-        if (existing?.status === 'READY') {
-            return res.json({ success: false, message: "Already connected" });
-        }
-
-        // Reuse existing QR if auth files still present
-        const clientDir = path.join(process.cwd(), 'sessions', clientId);
-        const hasAuthFiles = fs.existsSync(clientDir);
-        if (existing?.qr && existing?.status === 'UNAUTHENTICATED' && hasAuthFiles) {
-            console.log(`[QR] Reusing existing QR for ${clientId}`);
-            return res.json({ success: true, message: "QR already available", status: existing.status, qr: existing.qr });
-        }
-
-        // Clear stale QR, start fresh init
-        if (existing?.qr) {
-            await Session.updateOne({ clientId }, { $set: { qr: null, status: 'DISCONNECTED' } });
-        }
-
-        baileysManager.initializeSession(clientId).catch(err => console.error("[QR] Init Error:", err));
-        res.json({ success: true, message: "QR initializing", status: "INITIALIZING" });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/qr/status', authMiddleware, async (req, res) => {
-    try {
-        const clientId = req.userId || req.headers['x-client-id'] || 'default';
-        const session = await Session.findOne({ clientId });
-        res.json({
-            status: session?.status || 'DISCONNECTED',
-            qr: session?.qr || null,
-            whatsappConnected: session?.whatsappConnected || false,
-        });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
 app.post('/api/profiles/logout', authMiddleware, async (req, res) => {
     try {
         // ── Role check: only owner can disconnect WhatsApp ──────────────────
@@ -280,7 +213,7 @@ app.post('/api/profiles/logout', authMiddleware, async (req, res) => {
             }
         }
 
-        const clientId = req.userId || req.headers['x-client-id'] || 'default';
+        const clientId = req.workspaceId || req.userId || req.headers["x-workspace-id"] || "default";
         await baileysManager.destroySession(clientId);
         await purgeClient(clientId);
         res.json({ success: true, message: "Disconnected successfully." });
@@ -290,7 +223,7 @@ app.post('/api/profiles/logout', authMiddleware, async (req, res) => {
 // ── WhatsApp Pairing Code Endpoint ──────────────────────────────────
 app.post('/api/profiles/pairing-code', authMiddleware, async (req, res) => {
     try {
-        const clientId = req.userId || req.headers['x-client-id'] || 'default';
+        const clientId = req.workspaceId || req.userId || req.headers["x-workspace-id"] || "default";
         const { phoneNumber, code } = req.body;
 
         if (!phoneNumber) {
@@ -327,14 +260,14 @@ if (USE_BAILEYS) {
     // Get Baileys session status
     app.get('/api/baileys/status', async (req, res) => {
         if (!baileysManager) return res.status(503).json({ error: "Baileys not enabled" });
-        const status = baileysManager.getStatus(req.clientId || req.headers['x-client-id'] || 'default');
+        const status = baileysManager.getStatus(req.workspaceId || req.userId || req.headers["x-workspace-id"] || "default");
         res.json({ success: true, ...status });
     });
 
     // Force auto-wake (reconnect dormant session)
     app.post('/api/baileys/wake', async (req, res) => {
         if (!baileysManager) return res.status(503).json({ error: "Baileys not enabled" });
-        const clientId = req.clientId || req.headers['x-client-id'] || 'default';
+        const clientId = req.workspaceId || req.userId || req.headers["x-workspace-id"] || "default";
         try {
             await baileysManager.wakeClient(clientId);
             res.json({ success: true, message: "Session woken" });
@@ -351,7 +284,7 @@ if (USE_BAILEYS) {
     // Get Baileys configuration info
     app.get('/api/baileys/info', async (req, res) => {
         if (!baileysManager) return res.status(503).json({ error: "Baileys not enabled" });
-        const info = baileysManager.getStatus(req.clientId || req.headers['x-client-id'] || 'default');
+        const info = baileysManager.getStatus(req.workspaceId || req.userId || req.headers["x-workspace-id"] || "default");
         res.json(info);
     });
     
@@ -379,7 +312,7 @@ app.get('/api/auth/verify', (req, res) => {
 });
 
 // ── Google OAuth Routes ──────────────────────────────────────
-const GOOGLE_CALLBACK = process.env.GOOGLE_REDIRECT_URI || 'https://engine.brandproinc.in/api/google/callback';
+const GOOGLE_CALLBACK = 'https://engine.brandproinc.in/api/auth/google/callback';
 
 // Helper: get the real protocol behind Cloudflare proxy
 function getRealProtocol(req) {
@@ -387,33 +320,6 @@ function getRealProtocol(req) {
     return forwardedProto || req.protocol;
 }
 
-app.get('/api/auth/google/login', (req, res) => {
-    const clientId = req.query.clientId || req.headers['x-client-id'] || 'default';
-    const state = Buffer.from(JSON.stringify({ clientId, action: 'login' })).toString('base64');
-    const url = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        scope: GOOGLE_SCOPES,
-        state: state,
-        prompt: 'consent',
-        redirect_uri: GOOGLE_CALLBACK
-    });
-    res.redirect(url);
-});
-
-app.get('/api/auth/google/register', (req, res) => {
-    const clientId = req.query.clientId || req.headers['x-client-id'] || 'default';
-    const state = Buffer.from(JSON.stringify({ clientId, action: 'register' })).toString('base64');
-    const url = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        scope: GOOGLE_SCOPES,
-        state: state,
-        prompt: 'consent',
-        redirect_uri: GOOGLE_CALLBACK
-    });
-    res.redirect(url);
-});
-
-// Legacy /auth/google kept for backward compat
 app.get('/auth/google', (req, res) => {
     const clientId = req.query.clientId || 'default';
     const state = Buffer.from(JSON.stringify({ clientId })).toString('base64');
@@ -493,13 +399,9 @@ app.get('/api/google/callback', async (req, res) => {
             { upsert: true }
         );
 
-        // Issue JWT so frontend immediately has auth after redirect
-        const token = issueToken({ userId: email, email, displayName });
-
-        console.log(`✅ Google Account Linked for ${clientId}: ${email}`);
-        // Redirect to onboarding with token + success flag
-        // Frontend reads token from URL param and stores it in localStorage
-        res.redirect(`https://dash.concertos.brandproinc.in/onboarding?google_linked=1&token=${token}&clientId=${encodeURIComponent(clientId)}`);
+        console.log(`✅ Google Account Linked for ${clientId}: ${userInfo.data.email}`);
+        // Redirect to onboarding with success flag
+        res.redirect(`https://dash.concertos.brandproinc.in/onboarding?google_linked=1&clientId=${clientId}`);
     } catch (err) {
         console.error('❌ Google Auth Callback Error:', err.message);
         res.redirect('https://dash.concertos.brandproinc.in/onboarding?error=google_auth_failed');
@@ -583,38 +485,12 @@ const io = socketIo(server, {
         methods: ["GET", "POST"],
         credentials: true
     },
-    transports: ['websocket', 'polling'],
     pingInterval: 10000,
     pingTimeout: 5000,
     cookie: false
 });
 
 // Make io accessible to routes via req.app.get('io')
-
-// ── Socket.io Connection Handler ───────────────────────────────────────
-// CRITICAL: Without this, clients never join rooms and QR events never reach them.
-io.on('connection', (socket) => {
-    const clientId = socket.handshake.query.clientId || socket.handshake.query.clientid || 'default';
-    const origin = socket.handshake.headers.origin || socket.handshake.headers.referer || 'unknown';
-
-    console.log(`[Socket.io] ✅ CONNECT: socket=${socket.id} clientId=${clientId} origin=${origin}`);
-
-    // Join the client's dedicated room so _emit can target them specifically
-    socket.join(clientId);
-    console.log(`[Socket.io] ✅ JOINED ROOM: socket=${socket.id} room=${clientId}`);
-
-    // Acknowledge connection back to client
-    socket.emit('connected', { socketId: socket.id, clientId, message: 'Socket connected successfully' });
-
-    socket.on('disconnect', (reason) => {
-        console.log(`[Socket.io] ❌ DISCONNECT: socket=${socket.id} clientId=${clientId} reason=${reason}`);
-        socket.leave(clientId);
-    });
-
-    socket.on('error', (err) => {
-        console.error(`[Socket.io] ⚠️ ERROR: socket=${socket.id} clientId=${clientId} error=${err.message || err}`);
-    });
-});
 app.set('io', io);
 
 
@@ -803,22 +679,10 @@ async function getGmailThreadMessages(clientId, threadId) {
 
 // ─────────────────────────────────────────────────────────────
 
-// Helper: derive stable session key from phone/email (same algorithm as WhatsAppManager)
-function getSessionKey(phone, email) {
-    const identifier = phone || email;
-    if (!identifier) return null;
-    const crypto = require('crypto');
-    return crypto.createHash('sha256').update(identifier).digest('hex').substring(0, 16);
-}
-
 // Helper to update session state in DB
-async function updateSessionState(clientId, updates, phone, email) {
+async function updateSessionState(clientId, updates) {
     try {
         if (mongoose.connection.readyState !== 1) return null;
-
-        // Derive stable session key for phone-linked sessions
-        const sessionKey = getSessionKey(phone, email);
-
         // Try to get workspaceId/orgId from an existing session to preserve them
         const existing = await Session.findOne({ clientId }).select('workspaceId orgId userId phone email').lean();
         const setFields = {
@@ -832,7 +696,9 @@ async function updateSessionState(clientId, updates, phone, email) {
             { upsert: true, new: true }
         );
 
-        // If WhatsAppConnected changed, also sync sessions sharing the same phone/email
+        // If WhatsAppConnected changed, also sync the user's main session (usr_) so the
+        // dashboard (which reads the usr_ session) sees the correct WhatsApp status.
+        // Link via phone or email from the updated session.
         if (updates.whatsappConnected !== undefined && existing) {
             const identifier = existing.phone || existing.email;
             if (identifier) {
@@ -845,18 +711,6 @@ async function updateSessionState(clientId, updates, phone, email) {
                         ]
                     },
                     { $set: { whatsappConnected: updates.whatsappConnected, lastActive: new Date() } }
-                ).catch(() => {});
-            }
-        }
-
-        // CRITICAL: if userId session not found but a phone/email-linked session exists,
-        // try to find and update that session too (handles Google OAuth new userId case)
-        if (!existing && sessionKey) {
-            const phoneSession = await Session.findOne({ phone: phone || email }).select('clientId').lean();
-            if (phoneSession && phoneSession.clientId !== clientId) {
-                await Session.findOneAndUpdate(
-                    { clientId: phoneSession.clientId },
-                    { $set: { ...updates, lastActive: new Date() } }
                 ).catch(() => {});
             }
         }
@@ -911,22 +765,20 @@ async function upsertChat(clientId, wid, name, body, timestamp, fromMe = false, 
 
 // Helper to initialize a Baileys session for a user
 // Delegates to WhatsAppManager which handles all WebSocket/QR logic.
-// Passes phone when available so WhatsAppManager can key the session directory by phone hash.
-async function getClient(clientId, phone) {
+async function getClient(clientId) {
     if (!clientId) return null;
-    return await baileysManager.wakeClient(clientId, phone);
+    return await baileysManager.wakeClient(clientId);
 }
 
-async function purgeClient(clientId, sessionDirKey) {
+async function purgeClient(clientId) {
     if (!clientId) return;
-    console.log(`🧹 FULL PURGE: ${clientId} (sessionDirKey=${sessionDirKey || clientId})`);
+    console.log(`🧹 FULL PURGE: ${clientId}`);
     try {
         // 1. Destroy Baileys session
-        await baileysManager.destroySession(clientId, sessionDirKey);
+        await baileysManager.destroySession(clientId);
 
         // 2. Nuke the Baileys auth session directory (clean slate for re-link)
-        const dirKey = sessionDirKey || clientId;
-        const sessionDir = path.join(process.cwd(), 'sessions', dirKey);
+        const sessionDir = path.join(process.cwd(), 'sessions', clientId);
         if (fs.existsSync(sessionDir)) {
             try {
                 fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -1273,13 +1125,7 @@ app.post('/api/ai/toggle', async (req, res) => {
 });
 
 
-// Realtime CRM Endpoints - Multi-Tenant
-app.get('/api/leads', async (req, res) => {
-    try {
-        const leads = await Lead.find({ clientId: req.clientId }).sort({ updatedAt: -1 });
-        res.json({ success: true, leads });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// Leads CRUD routes (see src/routes/leads.js)
 
 app.get('/api/contacts/:id', async (req, res) => {
     try {
@@ -2344,45 +2190,33 @@ app.get('/api/logs', authMiddleware, async (req, res) => {
     res.json({ success: true, logs: systemLogs });
 });
 
-// Analytics API — stubbed for graceful fallback when MongoDB is unavailable
-// NOTE: This endpoint intentionally has NO authMiddleware so the dashboard home page
-// (which runs client-side) can always fetch stats without 401 errors on cold start.
-app.get('/api/analytics', async (req, res) => {
+// Analytics API
+app.get('/api/analytics', authMiddleware, async (req, res) => {
     try {
-        const clientId = req.clientId || req.userId || req.headers['x-client-id'] || 'default';
+        const workspaceId = req.workspaceId || req.userId;
         const now = new Date();
         const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-
-        // Guard: only query MongoDB when fully connected
-        if (mongoose.connection.readyState !== 1) {
-            return res.json({
-                success: true,
-                stats: {
-                    openTickets: 0,
-                    activeChats: 0,
-                    flaggedMessages: 0,
-                    avgResponseTime: '0',
-                    aiHandled: '0%',
-                    missedCalls: 0,
-                    volumeTrend: [0, 0, 0, 0, 0, 0, 0]
-                },
-                _stub: true
-            });
-        }
-
-        const workspaceId = req.workspaceId || req.userId || clientId;
 
         const [openTickets, activeLeads, aiHandledLeads, dailyVolume] = await Promise.all([
             Ticket.countDocuments({ workspaceId, status: { $ne: 'resolved' } }),
             Lead.countDocuments({ workspaceId }),
-            Lead.countDocuments({ workspaceId, 'conversation.role': 'ai' }),
+            Lead.countDocuments({
+                workspaceId,
+                'conversation.role': 'ai'
+            }),
             Lead.aggregate([
                 { $match: { workspaceId, createdAt: { $gte: sevenDaysAgo } } },
-                { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }, count: { $sum: 1 } } },
+                {
+                    $group: {
+                        _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+                        count: { $sum: 1 }
+                    }
+                },
                 { $sort: { "_id": 1 } }
             ])
         ]);
 
+        // Format daily volume for the frontend (7-day array)
         const volumeTrend = [];
         for (let i = 6; i >= 0; i--) {
             const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
@@ -2407,66 +2241,7 @@ app.get('/api/analytics', async (req, res) => {
                 volumeTrend
             }
         });
-    } catch (err) {
-        console.error('[Analytics] Error:', err.message);
-        res.json({
-            success: true,
-            stats: {
-                openTickets: 0,
-                activeChats: 0,
-                flaggedMessages: 0,
-                avgResponseTime: '0',
-                aiHandled: '0%',
-                missedCalls: 0,
-                volumeTrend: [0, 0, 0, 0, 0, 0, 0]
-            },
-            _stub: true
-        });
-    }
-});
-
-// ── Stub: /api/analytics/v2 — newer shape matching the dashboard home page
-// Returns { success, data: { revenue, leads, conversations, tickets, aiEfficiency, openTickets, signalSuccess } }
-app.get('/api/analytics/v2', async (req, res) => {
-    try {
-        const clientId = req.clientId || req.userId || req.headers['x-client-id'] || 'default';
-        if (mongoose.connection.readyState !== 1) {
-            return res.json({
-                success: true,
-                data: {
-                    revenue: { total: 0, trend: 0 },
-                    leads: 0, conversations: 0, tickets: 0,
-                    aiEfficiency: 98.2, openTickets: 0, signalSuccess: 99.4
-                },
-                _stub: true
-            });
-        }
-        const now = new Date();
-        const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        const [leads, conversations, tickets] = await Promise.all([
-            Lead.countDocuments({ clientId, createdAt: { $gte: sevenDaysAgo } }),
-            Chat.countDocuments({ clientId, lastInteraction: { $gte: Math.floor(sevenDaysAgo.getTime() / 1000) } }),
-            Ticket.countDocuments({ clientId, createdAt: { $gte: sevenDaysAgo } })
-        ]);
-        res.json({
-            success: true,
-            data: {
-                revenue: { total: 0, trend: 0 },
-                leads,
-                conversations,
-                tickets,
-                aiEfficiency: 98.2,
-                openTickets: tickets,
-                signalSuccess: 99.4
-            }
-        });
-    } catch (err) {
-        res.json({
-            success: true,
-            data: { revenue: { total: 0 }, leads: 0, conversations: 0, tickets: 0, aiEfficiency: 98.2, openTickets: 0, signalSuccess: 99.4 },
-            _stub: true
-        });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ═══════════════════════════════════════════════════

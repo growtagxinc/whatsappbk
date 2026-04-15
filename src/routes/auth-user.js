@@ -368,7 +368,6 @@ router.post('/register', validate(RegisterSchema), async (req, res) => {
             redirect: '/onboarding',
         });
     } catch (err) {
-        // Extended debug: log full error so we can see it in VPS logs
         console.error(`[REGISTER FAILED] step=${err.step || 'unknown'} name=${err.name} message=${err.message} code=${err.code || 'none'} stack=${err.stack}`);
         const errorMap = {
             ValidationError: { status: 400, code: 'VALIDATION_ERROR' },
@@ -377,6 +376,7 @@ router.post('/register', validate(RegisterSchema), async (req, res) => {
             MongoTimeoutError: { status: 503, code: 'DB_TIMEOUT' },
         };
         const mapped = errorMap[err.name] || { status: 500, code: 'UNKNOWN_ERROR' };
+        // Include a safe error tag only — no stack traces or internals in response
         res.status(mapped.status).json({
             error: 'Registration failed',
             code: mapped.code,

@@ -75,7 +75,7 @@ async function handleFaq(userMessage, auditData = null) {
             messages: [{ role: "user", content: sanitized.clean }],
             schema: FaqResponseSchema,
             schemaName: "FaqResponse",
-            systemPrompt: aiConfig.faq.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\"}",
+            systemPrompt: `You are a helpful FAQ assistant. Respond with ONLY valid JSON — no explanation, no markdown, no extra text.\n\nRequired JSON format:\n{"response": "your reply text here"}\n\n${aiConfig.faq.prompt}${auditContext}\n\nRespond with JSON only.`,
             temperature: 0.4,
             maxRetries: 3,
         });
@@ -105,7 +105,7 @@ async function handleSales(userMessage, auditData = null) {
             messages: [{ role: "user", content: sanitized.clean }],
             schema: SalesResponseSchema,
             schemaName: "SalesResponse",
-            systemPrompt: aiConfig.sales.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\", \"qualification\": \"HOT/WARM/COLD\"}",
+            systemPrompt: `You are a sales assistant. Respond with ONLY valid JSON — no explanation, no markdown, no extra text.\n\nRequired JSON format:\n{"response": "your reply text", "qualification": "HOT|WARM|COLD"}\n\n${aiConfig.sales.prompt}${auditContext}\n\nRespond with JSON only.`,
             temperature: 0.4,
             maxRetries: 3,
         });
@@ -138,7 +138,7 @@ async function handleCustom(userMessage, auditData = null) {
             messages: [{ role: "user", content: sanitized.clean }],
             schema: CustomResponseSchema,
             schemaName: "CustomResponse",
-            systemPrompt: aiConfig.custom.prompt + auditContext + "\nOutput JSON: {\"response\": \"...\"}",
+            systemPrompt: `You are a custom request handler. Respond with ONLY valid JSON — no explanation, no markdown, no extra text.\n\nRequired JSON format:\n{"response": "your reply text"}\n\n${aiConfig.custom.prompt}${auditContext}\n\nRespond with JSON only.`,
             temperature: 0.7,
             maxRetries: 3,
         });

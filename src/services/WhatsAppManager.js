@@ -24,8 +24,6 @@ const pendingMessages = new Map(); // clientId -> Array of { jid, text, timestam
 const lastActivity = new Map();    // clientId -> timestamp
 const messageQueue = [];           // BullMQ queue fallback (Redis-backed in production)
 const linkFailures = new Map();    // clientId -> consecutive failure count (for 405 backoff)
-const reconnectTimers = new Map(); // clientId -> TimeoutId for pending reconnect (prevents race conditions)
-const pendingInits = new Map();   // clientId -> Promise of in-flight initializeSession (prevents concurrent inits)
 
 // Config constants
 const SESSION_DIR = path.join(process.cwd(), 'sessions');
@@ -141,30 +139,17 @@ class WhatsAppManager {
      * @param {string} clientId
      * @returns {Promise<object>} Baileys socket
      */
-    // ── Deduplication wrapper: prevents cascade of concurrent initializeSession calls ──
-    // Two callers can fire simultaneously:
-    //   A. Scheduled reconnect timer (5s after close)
-    //   B. Dashboard poll / health check (every 5s / 30s)
-    // Both call this wrapper. The wrapper ensures only ONE actual init runs at a time.
     async initializeSession(clientId, phone) {
         if (!clientId) throw new Error('clientId required');
 
-        // Cancel any pending reconnect timer — we're creating a fresh socket now.
-        if (reconnectTimers.has(clientId)) {
-            clearTimeout(reconnectTimers.get(clientId));
-            reconnectTimers.delete(clientId);
-            console.log(`[Baileys] Cancelled pending reconnect for ${clientId}`);
-        }
+        // Derive a stable session key from phone — survives auth method changes (password vs Google OAuth).
+        // Key is SHA-256 hash of the phone number, first 16 hex chars. Falls back to clientId when phone is unavailable.
+        const phoneHash = phone
+            ? crypto.createHash('sha256').update(phone).digest('hex').substring(0, 16)
+            : null;
+        const sessionKey = phoneHash || clientId;
 
-        // De-duplicate: if an init is already in flight for this client, wait for it.
-        // This prevents the cascade where a scheduled reconnect fires while a
-        // dashboard-initiated init is also running.
-        if (pendingInits.has(clientId)) {
-            console.log(`[Baileys] Init already in flight for ${clientId}, waiting...`);
-            return pendingInits.get(clientId);
-        }
-
-        // Return existing authenticated socket if alive
+        // Return existing authenticated socket (in-memory Map keyed by clientId — always use clientId here)
         if (clients.has(clientId)) {
             const sock = clients.get(clientId);
             if (sock.ws && sock.ws.readyState === 1) {
@@ -174,25 +159,9 @@ class WhatsAppManager {
             console.log(`[Baileys] Stale socket found for ${clientId} (readyState=${sock.ws?.readyState}), reinitializing`);
         }
 
-        // Derive a stable session key from phone — survives auth method changes.
-        const phoneHash = phone
-            ? crypto.createHash('sha256').update(phone).digest('hex').substring(0, 16)
-            : null;
-        const sessionKey = phoneHash || clientId;
-
-        // Mark init as in-flight; _doInitializeSession calls this method so we need
-        // the wrapper to set the promise BEFORE calling the body.
-        const initPromise = this._doInitializeSession(clientId, phoneHash, sessionKey).finally(() => {
-            pendingInits.delete(clientId);
-        });
-        pendingInits.set(clientId, initPromise);
-        return initPromise;
-    }
-
-    // ── Actual session initialization (called only by the initializeSession wrapper above) ──
-    async _doInitializeSession(clientId, phoneHash, sessionKey) {
         // Wipe stale session files on every fresh init attempt — this fixes the case where
         // WhatsApp rejected the link (405 "too many devices") and Baileys can't resume.
+        // Without this, the stale creds cause immediate failure on reconnect, no QR ever generated.
         const clientDir = path.join(SESSION_DIR, sessionKey);
         if (fs.existsSync(clientDir)) {
             try { fs.rmSync(clientDir, { recursive: true, force: true }); } catch (e) {}
@@ -334,12 +303,6 @@ class WhatsAppManager {
                     console.log(`[Baileys] [SEQ=${sockSeq}] OPEN skipped — _onConnected already ran for this client`);
                     return; // Guard: skip if _onConnected already ran
                 }
-                // Cancel any pending reconnect timers — we're connected successfully.
-                if (reconnectTimers.has(clientId)) {
-                    clearTimeout(reconnectTimers.get(clientId));
-                    reconnectTimers.delete(clientId);
-                    console.log(`[Baileys] Cancelled pending reconnect on successful connect for ${clientId}`);
-                }
                 this._onConnectedFired.set(clientId, true);
                 console.log(`[Baileys] [SEQ=${sockSeq}] Connected for ${clientId}, running _onConnected...`);
                 this._updateStatus(clientId, 'READY', { authenticated: true, qr: null });
@@ -434,13 +397,11 @@ class WhatsAppManager {
                     if (attempts <= 3) { // Limit to 3 retries
                         const delay = Math.min(5000 * Math.pow(2, attempts - 1), 30000); // Max 30s delay
                         console.log(`[Baileys] Scheduling reconnect for ${clientId} in ${delay}ms (attempt ${attempts})`);
-                        const timerId = setTimeout(async () => {
-                            reconnectTimers.delete(clientId);
-                            this.wakeClient(clientId).catch(err => {
+                        setTimeout(() => {
+                            this.initializeSession(clientId, phone).catch(err => {
                                 console.error(`[Baileys] Reconnect failed for ${clientId}:`, err.message);
                             });
                         }, delay);
-                        reconnectTimers.set(clientId, timerId);
                     } else {
                         console.error(`[Baileys] Max reconnect attempts reached for ${clientId}`);
                         this.reconnectAttempts.delete(clientId);
@@ -764,7 +725,7 @@ class WhatsAppManager {
         if (idleTimers.has(clientId)) clearTimeout(idleTimers.get(clientId));
         const timer = setTimeout(async () => {
             console.log(`[Baileys] Auto-pruning idle client: ${clientId}`);
-            await this._pruneClient(clientId, true);
+            await this._pruneClient(clientId, keepAuth = true);
         }, IDLE_TIMEOUT_MS);
         idleTimers.set(clientId, timer);
         lastActivity.set(clientId, Date.now());
@@ -876,7 +837,7 @@ class WhatsAppManager {
             for (const [clientId, last] of lastActivity) {
                 if (now - last > IDLE_TIMEOUT_MS) {
                     console.log(`[Pruner] Force-pruning inactive client: ${clientId}`);
-                    await this._pruneClient(clientId, true);
+                    await this._pruneClient(clientId, keepAuth = true);
                 }
             }
         }, PRUNE_INTERVAL_MS);
@@ -1023,7 +984,7 @@ class WhatsAppManager {
     shutdown() {
         if (this.pruneTimer) clearInterval(this.pruneTimer);
         for (const [clientId] of clients) {
-            this._pruneClient(clientId, true).catch(() => {});
+            this._pruneClient(clientId, keepAuth = true).catch(() => {});
         }
 
         // Clear all health check intervals

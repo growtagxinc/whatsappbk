@@ -31,7 +31,7 @@ async function handleVision(imageInput, textPrompt = "Analyze all the images sen
 Note: If this verified data contradicts the screenshots, PRIORITIZE this verified data.`;
         }
 
-        const promptTemplate = `${configPrompt}${auditContext}\n\nUser Message/Prompt: "${textPrompt}"\n\nTotal images in this conversation: ${imageCount}. Analyze ALL of them together before responding.\n\nSPECIAL INSTRUCTION: If any image is a QR code or contains a social media profile URL, decode the URL and return it in your JSON.\n\nOutput JSON ONLY: {"response": "...", "profileUrl": "https://instagram.com/user"}`;
+        const promptTemplate = `You are a vision analysis assistant. Respond with ONLY valid JSON — no explanation, no markdown, no extra text.\n\nRequired JSON format:\n{"response": "your analysis text", "profileUrl": "https://... or null"}\n\n${configPrompt}${auditContext}\n\nUser Message/Prompt: "${textPrompt}"\n\nTotal images in this conversation: ${imageCount}. Analyze ALL of them together before responding.\n\nIf any image is a QR code or contains a social media profile URL, decode the URL and return it as profileUrl.\n\nRespond with JSON only.`;
 
         // Build content array for OpenRouter vision model
         const contentParts = [

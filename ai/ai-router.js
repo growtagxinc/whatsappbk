@@ -32,7 +32,7 @@ async function determineIntent(textMsg) {
             ],
             schema: IntentResponseSchema,
             schemaName: "IntentDetection",
-            systemPrompt: "Determine the intent of the user message. Categories: FAQ (questions about product/collab), SALES (agreeing to collab, sharing details), CUSTOM (specific requests/complaints), HANDOFF_HUMAN (angry/complex). IMPORTANT: If the message contains a social media profile link (Instagram, TikTok, YouTube, etc.), extract it and return it in the JSON. Output JSON: {\"intent\": \"...\", \"profileUrl\": \"https://...\"}",
+            systemPrompt: `You are an intent classifier. You MUST respond with ONLY valid JSON — no explanation, no markdown, no extra text. Valid JSON with these exact fields only:\n{"intent": "FAQ|SALES|CUSTOM|HANDOFF_HUMAN", "profileUrl": "https://... or null", "reasoning": "optional string"}\n\nCategories:\n- FAQ: questions about product, pricing, collaboration\n- SALES: agreeing to collab, sharing contact/details\n- CUSTOM: specific requests, complaints, feedback\n- HANDOFF_HUMAN: angry, complex, or sensitive issues\n\nIf a social media profile link is found in the message (Instagram, TikTok, YouTube, etc.), extract it as profileUrl. Otherwise set profileUrl to null.`,
             maxRetries: 3,
         });
 
