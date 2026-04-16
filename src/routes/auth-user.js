@@ -236,6 +236,7 @@ async function buildMeResponse(userId, orgId, workspaceId) {
 }
 
 // ─── POST /api/auth/register ───────────────────────────────────
+console.log('[MODULE LOAD] zxcvbn type:', typeof zxcvbn, '| bcrypt type:', typeof bcrypt.hash);
 router.post('/register', validate(RegisterSchema), async (req, res) => {
     console.log('[REGISTER] body:', JSON.stringify(req.body));
     try {
