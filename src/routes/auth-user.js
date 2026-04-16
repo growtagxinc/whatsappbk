@@ -237,8 +237,10 @@ async function buildMeResponse(userId, orgId, workspaceId) {
 
 // ─── POST /api/auth/register ───────────────────────────────────
 router.post('/register', validate(RegisterSchema), async (req, res) => {
+    console.log('[REGISTER] body:', JSON.stringify(req.body));
     try {
         const { email, password, orgName, workspaceName, phone, displayName } = req.validatedBody;
+        console.log('[REGISTER] validatedBody:', JSON.stringify(req.validatedBody));
 
         const normalizedEmail = email.toLowerCase().trim();
 
